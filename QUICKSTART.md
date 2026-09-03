@@ -141,6 +141,14 @@ What each line does:
   supported only when TP == 1 and is inert under tensor parallelism.
 - `--moe-hot-adapt-idle-min-interval-ms N`: sets the minimum time between
   repeated idle adaptation ticks. The default is 2000 milliseconds.
+- `--moe-hot-adapt-prefill-weight N`: scales prefill route counts before they
+  update HOT adaptation counters. The default is 1.0.
+- `--moe-hot-adapt-prefill-run-cap-frac N`: caps total row swaps across one
+  consecutive prefill run as a fraction of the HOT budget. The default is 0,
+  which disables the run cap.
+- `--moe-hot-adapt-post-prefill-tick {on,off}`: runs one immediate standard-cap
+  adaptation tick at the first decode boundary after prefill. The default is
+  `off`.
 - `--moe-hot-plan-persist {auto,on,off}`: controls HOT plan loading and
   snapshots. The default is `auto`, which enables writes when the plan
   directory is writable. `on` requests persistence explicitly, and `off`

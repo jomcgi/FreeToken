@@ -969,6 +969,15 @@ class Engine:
                 boundary_cap_frac=getattr(
                     config, "moe_hot_adapt_boundary_cap_frac", 0.5
                 ),
+                prefill_weight=getattr(
+                    config, "moe_hot_adapt_prefill_weight", 1.0
+                ),
+                prefill_run_cap_frac=getattr(
+                    config, "moe_hot_adapt_prefill_run_cap_frac", 0.0
+                ),
+                post_prefill_tick=getattr(
+                    config, "moe_hot_adapt_post_prefill_tick", False
+                ),
                 persisted_counter_seed=(
                     hot_plan_seed.counters if hot_plan_seed is not None else None
                 ),
@@ -1165,6 +1174,10 @@ class Engine:
             swiglu_limit=getattr(sample, "swiglu_limit", None),
             disk_lookahead=config.moe_disk_lookahead == "on",
             step_timing=config.moe_step_timing,
+            moe_cpu_precb=config.moe_cpu_precb,
+            moe_cpu_willneed=config.moe_cpu_willneed,
+            moe_cpu_willneed_recent_steps=config.moe_cpu_willneed_recent_steps,
+            moe_cpu_willneed_fault_ceiling=config.moe_cpu_willneed_fault_ceiling,
             prefill_coalesce=(
                 getattr(config, "moe_prefill_coalesce", "populate")
                 if config.moe_disk_prefill == "cpu"
@@ -1483,8 +1496,12 @@ class Engine:
             # Diagnostic mode deliberately resolves before another graph replay can
             # overwrite its captured per-layer events. The default path never syncs here.
             ended.synchronize()
+            step_end_host_ns = time.monotonic_ns()
             batch.moe_step_timing = self.cpu_moe_executor.resolve_step_timing(
-                batch.padded_size, started, ended
+                batch.padded_size,
+                started,
+                ended,
+                step_end_host_ns=step_end_host_ns,
             )
         if self.cpu_moe_executor is not None:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
@@ -2739,6 +2756,9 @@ _DENSE_MOE_SETTINGS = {
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
     "moe_hot_adapt_boundary_cap_frac": 0.5,
+    "moe_hot_adapt_prefill_weight": 1.0,
+    "moe_hot_adapt_prefill_run_cap_frac": 0.0,
+    "moe_hot_adapt_post_prefill_tick": False,
     "moe_hot_plan_persist": "auto",
     "moe_hot_plan_dir": None,
     "moe_hot_plan_interval_minutes": 10.0,
@@ -2753,6 +2773,10 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_pager": "madvise",
     "moe_disk_lookahead": "on",
     "moe_step_timing": False,
+    "moe_cpu_precb": "before",
+    "moe_cpu_willneed": "always",
+    "moe_cpu_willneed_recent_steps": 256,
+    "moe_cpu_willneed_fault_ceiling": 2000.0,
     "host_cache_reserve_gib": None,
     "moe_pager_budget_gib": None,
     "moe_cpu_threads": 0,

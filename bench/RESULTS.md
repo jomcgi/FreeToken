@@ -962,3 +962,101 @@ and leaves the ladder 41 reclaimable slots against the ~163 it needs to
 reach the cap. Serving box downtime from the arms: one 13-minute strand at
 18:10 UTC when a spin arm hung and the driver died with the ssh session
 (the runner is detached and watchdogged since), plus about 100 s per arm.
+
+## Round two, late 2026-09-03 (node-4, fork issues #13, #16, #17)
+
+Same box, same serving profile, same A/B protocol (detached driver, hot plan
+backed up and restored around every arm, control run last on a warm page
+cache, compare only arms with similar major faults per step). The evening's
+timers said the executor task was about 850 us of a 1,460 us per-layer window
+and the rest was "handoff outside the task". That framing was wrong, and
+finding out why is most of this section.
+
+### The wake bucket was the WILLNEED callback
+
+`submit()` stamps the doorbell first and then, before any worker is notified,
+builds the decode groups, takes the GIL, and runs the Python pre-run callback
+(`prefetch_experts`: dedupe, stats, and one `madvise(MADV_WILLNEED)` per
+coalesced expert range on every DISK bank of the layer). So "wake" was four
+things. Splitting it (branch `feat/handoff-timers`, merged as f560cd0), per
+DISK layer, 28 layers per step, `--moe-step-timing`:
+
+| arm | x1 wall tok/s | batches (median) | CPU windows/step | wake | precb | compute | major faults/step |
+|---|---|---|---|---|---|---|---|
+| control, default order | 19.9, 16.3, 19.8 | 21 to 25 (22.3) | 41.3 ms | 409 us | 384 | 466 | 135 |
+| `--moe-cpu-precb after` (callback after notify) | 18.5, 18.8, 17.7 | 18 to 22 | 45.2 ms | 17 | 475, overlapped | 788 | 626 |
+| host-func handshake (`FREETOKEN_CPU_MOE_FLAG_SYNC=0`) | 14.8, 18.5, 16.7 | 17 to 24 (19.6) | 54.1 ms | 451 | 425 | 838 | 993 |
+| `--moe-cpu-willneed recent` | 22.0, 22.6, 16.4 | 25 to 29 (24) | 33.4 ms | 64 | 40 | 513 | 476 |
+
+Groups, GIL and notify are 1, 1 and 22 us; the coordinator's own overhead is
+5 us; the host-clock-calibrated GPU-side latencies (doorbell to coordinator,
+done flag to the GPU wait releasing) are under 10 us in both directions. The
+callback is the bucket, and its cost is the kernel walking the page cache for
+every page of the advised range even when the pages are resident.
+
+Moving the callback after the notify removes it from wake and loses anyway:
+the workers fault the pages themselves, major faults double and compute rises
+by 300 us. So the advice is doing real work whenever a page is not resident.
+The host-func handshake is a clear loss and memops stay.
+
+`--moe-cpu-willneed recent` skips the advice for experts this executor
+computed on the same layer within the last 256 decode steps (their pages are
+resident by construction), with a rolling major-fault ceiling that falls back
+to always-advise for 256 steps after a prefill has destroyed the page cache.
+It takes about 8 ms off a 41 ms step. The price is more faults during compute
+and the guard tripped twice in a three-minute arm at the 2,000 ceiling, so the
+code default stays `always` and the production unit carries the flag.
+
+### What actually fills the step
+
+With the callback out of the way the DISK layers cost about 0.6 ms each, 17 ms
+of a 37 ms step, and the GPU-side handoff is not the remainder. The other 20
+MoE layers are PINNED: their routed experts stream over PCIe every step (one
+fused gather kernel at about 31 GB/s, on the same stream, immediately before
+the GEMM) through what is left of the slot pool after the DISK hot rows are
+carved off, about 1,450 LRU slots shared by all 20 layers. Those layers have
+no hot set and no frequency signal: every gate in the code says the hot set is
+DISK-only, and nothing writes the decayed counters for a PINNED layer. That is
+issue #17 (`feat/pinned-hot-set`, `--moe-pinned-hot-budget-gib`, in test as
+this is written). The slot pool is fixed on a 24 GB card, so PINNED hot rows
+only exist by lowering the DISK budget; the arms trade 1 and 2 GiB across.
+
+### The long document, valid this time
+
+The evening's real-text number (a 76,570-token document, then three essays
+at 9.1 to 12.3 tok/s) had one control and no arms. Three knobs, each default
+off, on `feat/hot-adapt-phase-weight` (merged as ea0e4ae): a multiplier on
+prefill route counts before they reach the decayed counters, a cap on the
+total swap over a run of consecutive prefill boundaries, and a forced tick at
+the first decode boundary after a prefill run.
+
+The first chain of arms measured nothing: the document hit the KV disk cache
+and "prefilled" in 11 to 16 s, so no prefill routes were ever counted and the
+knobs never ran. A nonce at the start of the prompt fixed it, and the wall
+time of the long request is now the first thing to check on any prefill arm.
+Valid arms, post-document turns of 200 tokens, wall tok/s, then the realised
+hot-pair rate against the oracle, control last:
+
+| arm | prefill | turn 1 | turn 2 | turn 3 | realised / oracle |
+|---|---|---|---|---|---|
+| `--moe-hot-adapt-prefill-weight 0.1` | 630 s | 11.0 | 15.2 | 15.8 | 47 to 53% / 93% |
+| `--moe-hot-adapt-prefill-run-cap-frac 0.5` | 679 s | 10.9 | 12.8 | 13.7 | 35% / 94% |
+| `--moe-hot-adapt-post-prefill-tick on` | 588 s | 8.8 | 12.2 | 8.8 | 15 to 16% / 93% |
+| all three | 640 s | 10.1 | 11.6 | 15.5 | 46 to 48% / 93% |
+| control | 570 s | 4.9 | 12.3 | 7.2 | 15 to 16% / 94% |
+
+The weight is the whole effect. The counters are document-dominated because
+a 2,048-token chunk adds up to 2,048 route counts per invocation while a
+decode step adds ten, so a forced tick or a churn cap only re-ranks toward the
+document. The production unit carries the weight at 0.1; a weight that
+normalises by tokens per invocation is the obvious follow-up.
+
+### Production
+
+Deployed at 23:51 UTC: tier f560cd0 with `--moe-cpu-willneed recent` in the
+unit (post-deploy probe 11.6 tok/s cold, warming). Queued behind the #17
+arms: tier ea0e4ae with `--moe-hot-adapt-prefill-weight 0.1` added. The
+previous checkout and the unit file are kept for rollback. Box time lost to
+the harness tonight: about 15 minutes to the cache-hit chain and 11 minutes to
+an idle check that matched the word "running" inside a dead unit's command
+line (`--max-running-requests`).

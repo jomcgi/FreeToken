@@ -1,0 +1,15 @@
+Implemented both phases with default behavior preserved.
+
+- Added `--moe-cpu-willneed {always,recent}`, recency/fault controls, 64-step fault guard, 256-step fallback, stats, and scheduler rendering in [cpu_executor.py](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/moe/cpu_executor.py), [args.py](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/server/args.py), [config.py](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/engine/config.py), and [scheduler.py](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/scheduler/scheduler.py).
+- Added raw native timestamps and calibrated `cpu_gpu_in_us` / `cpu_gpu_out_us` through [cpu_moe_ext.cpp](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp), [engine.py](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/engine/engine.py), and [status.py](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/scheduler/status.py).
+- Updated [CLI documentation](/Users/jomcgi/repos/ft-worktrees/handoff-timers/docs/cli.md) and all four requested test files.
+- Did not touch `host_banks.py`, alter lookahead logic, or create a commit.
+
+Validation:
+
+- GPU-free tests with temporary import stubs: 26 passed.
+- Python compilation, focused Ruff checks, and `git diff --check`: passed.
+- Normal pytest collection is unavailable because this machine lacks Torch and `huggingface_hub`; the `python` command is also absent.
+- C++ could not be compiled here. All edited hunks were reread, field/key names matched, and whole-file brace counts are balanced at 415/415.
+
+Open questions: none.

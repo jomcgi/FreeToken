@@ -56,6 +56,8 @@ _FLAG_SYNC = os.getenv("FREETOKEN_CPU_MOE_FLAG_SYNC", "1") != "0"
 # sizes plus any eager padded sizes); more than that is unheard of, and the overflow
 # just keeps the host-func path for the extra combos.
 _FLAG_SLOTS_PER_LAYER = 16
+_WILLNEED_FAULT_WINDOW_STEPS = 64
+_WILLNEED_GUARD_HOLD_STEPS = 256
 
 # MoeTask::num_tokens and CpuMoeExecutor::create_task use a signed C++ int.
 CPU_MOE_MAX_TASK_TOKENS = (1 << 31) - 1
@@ -328,6 +330,10 @@ class CpuMoeExecutor:
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
         step_timing: bool = False,
+        moe_cpu_precb: str = "before",
+        moe_cpu_willneed: str = "always",
+        moe_cpu_willneed_recent_steps: int = 256,
+        moe_cpu_willneed_fault_ceiling: float = 2000.0,
         prefill_coalesce: str | bool = "populate",
         prefill_coalesce_budget_bytes: int = 40 << 30,
         prefill_batch: str | bool = "on",
@@ -366,6 +372,11 @@ class CpuMoeExecutor:
         self.max_tokens = int(max_tokens)
         self.apply_router_weight_on_input = bool(apply_router_weight_on_input)
         self._step_timing = bool(step_timing)
+        if moe_cpu_precb not in ("before", "after"):
+            raise ValueError(
+                "moe_cpu_precb must be 'before' or 'after', got "
+                f"{moe_cpu_precb!r}"
+            )
         timing_methods = ("task_last_run_ns", "step_timing_snapshot_and_reset")
         if self._step_timing and not all(
             hasattr(_cpu_moe.CpuMoeExecutor, name) for name in timing_methods
@@ -390,6 +401,11 @@ class CpuMoeExecutor:
         self._disk_minor_fault_base, self._disk_major_fault_base = _process_faults()
         self._disk_prefetch_error: BaseException | None = None
         ptrs, (self.H, self.I) = self._resolve_banks(cache.bank_sources, fmt)
+        self._configure_willneed(
+            moe_cpu_willneed,
+            moe_cpu_willneed_recent_steps,
+            moe_cpu_willneed_fault_ceiling,
+        )
         if self._step_timing:
             ptrs["task_timing_enabled"] = True
         if isinstance(prefill_coalesce, bool):
@@ -508,6 +524,7 @@ class CpuMoeExecutor:
             core_ids=core_ids,
             **ptrs,
         )
+        self._configure_pre_run_callback_mode(moe_cpu_precb)
         self._configure_prefill_batch()
         if self._disk_banks:
             self._disk_callback = partial(_disk_prefetch_callback, weakref.ref(self))
@@ -611,6 +628,41 @@ class CpuMoeExecutor:
                 f"expert limits={self._prefill_coalesce_limits}, "
                 f"populate scratch={self._prefill_populate_scratch_bytes / 2**20:.0f} MiB"
             )
+
+    def _configure_pre_run_callback_mode(self, mode: str) -> None:
+        if mode == "after":
+            self._ext.set_pre_run_callback_mode(1)
+
+    def _configure_willneed(
+        self, mode: str, recent_steps: int, fault_ceiling: float
+    ) -> None:
+        if mode not in ("always", "recent"):
+            raise ValueError(
+                "moe_cpu_willneed must be 'always' or 'recent', got " f"{mode!r}"
+            )
+        if int(recent_steps) <= 0:
+            raise ValueError("moe_cpu_willneed_recent_steps must be positive")
+        if not float(fault_ceiling) > 0:
+            raise ValueError("moe_cpu_willneed_fault_ceiling must be positive")
+        self._moe_cpu_willneed = mode
+        self._willneed_guard_trips = 0
+        if mode == "always":
+            return
+        self._willneed_recent_steps = int(recent_steps)
+        self._willneed_fault_ceiling = float(fault_ceiling)
+        never = -(1 << 60)
+        self._willneed_last_touch = {
+            layer_id: [never] * self.num_experts for layer_id in self._disk_banks
+        }
+        self._willneed_layer_steps = [0] * self.num_layers
+        self._willneed_skipped_experts = 0
+        self._willneed_advised_experts = 0
+        self._willneed_fault_window = [0] * _WILLNEED_FAULT_WINDOW_STEPS
+        self._willneed_fault_window_sum = 0
+        self._willneed_fault_window_pos = 0
+        self._willneed_fault_window_samples = 0
+        self._willneed_fault_last_major = self._disk_major_fault_base
+        self._willneed_guard_steps_remaining = 0
 
     def _configure_prefill_batch(self) -> None:
         if not self._prefill_batch_requested:
@@ -863,10 +915,28 @@ class CpuMoeExecutor:
             self._step_timing_events[key] = timing
         return timing
 
-    def step_timing_breakdown(self, bs: int | None = None) -> dict:
-        """Return and reset native per-layer decode timings since the prior call."""
+    def step_timing_breakdown(
+        self,
+        bs: int | None = None,
+        step_end: torch.cuda.Event | None = None,
+        step_end_host_ns: int | None = None,
+    ) -> dict:
+        """Return and reset native per-layer decode timings since the prior call.
+
+        With ``moe_cpu_precb="after"``, ``precb_us`` overlaps CPU compute and is
+        reported separately rather than as part of ``wake_us``.
+        """
         zero_total = {
             "wake_us": 0.0,
+            "groups_us": 0.0,
+            "gil_us": 0.0,
+            "precb_us": 0.0,
+            "notify_us": 0.0,
+            "coord_pre_us": 0.0,
+            "coord_post_us": 0.0,
+            "gpu_in_us": 0.0,
+            "gpu_out_us": 0.0,
+            "h2d_us": 0.0,
             "compute_us": 0.0,
             "signal_us": 0.0,
             "total_tasks": 0,
@@ -886,14 +956,51 @@ class CpuMoeExecutor:
         for raw_layer_id, raw in snapshot.items():
             layer_id = int(raw_layer_id)
             d2h_us = 0.0
+            h2d_us = 0.0
+            gpu_in_us = 0.0
+            gpu_out_us = 0.0
             if bs is not None:
                 timing = getattr(self, "_step_timing_events", {}).get((layer_id, bs))
                 if timing is not None:
                     d2h_us = float(
                         timing.d2h_start.elapsed_time(timing.overlap_start) * 1000.0
                     )
+                    h2d_us = float(
+                        timing.wait_done.elapsed_time(timing.layer_end) * 1000.0
+                    )
+                    last_seen_ns = int(raw.get("last_seen_ns", 0))
+                    if (
+                        step_end_host_ns is not None
+                        and step_end is not None
+                        and last_seen_ns != 0
+                    ):
+                        # On Linux, C++ steady_clock and time.monotonic_ns both use
+                        # CLOCK_MONOTONIC. The step end maps CUDA offsets onto it.
+                        overlap_start_host_ns = step_end_host_ns - int(
+                            timing.overlap_start.elapsed_time(step_end) * 1e6
+                        )
+                        wait_done_host_ns = step_end_host_ns - int(
+                            timing.wait_done.elapsed_time(step_end) * 1e6
+                        )
+                        gpu_in_us = max(
+                            0, last_seen_ns - overlap_start_host_ns
+                        ) / 1000.0
+                        gpu_out_us = max(
+                            0,
+                            wait_done_host_ns
+                            - int(raw.get("last_done_stored_ns", 0)),
+                        ) / 1000.0
             per_layer[layer_id] = {
                 "wake_us": float(raw.get("wake_us", 0.0)),
+                "groups_us": float(raw.get("groups_us", 0.0)),
+                "gil_us": float(raw.get("gil_us", 0.0)),
+                "precb_us": float(raw.get("precb_us", 0.0)),
+                "notify_us": float(raw.get("notify_us", 0.0)),
+                "coord_pre_us": float(raw.get("coord_pre_us", 0.0)),
+                "coord_post_us": float(raw.get("coord_post_us", 0.0)),
+                "gpu_in_us": gpu_in_us,
+                "gpu_out_us": gpu_out_us,
+                "h2d_us": max(0.0, h2d_us),
                 "compute_us": float(raw.get("compute_us", 0.0)),
                 "signal_us": float(raw.get("signal_us", 0.0)),
                 "tasks": int(raw.get("tasks", 0)),
@@ -905,6 +1012,15 @@ class CpuMoeExecutor:
         total = dict(zero_total)
         for row in per_layer.values():
             total["wake_us"] += row["wake_us"]
+            total["groups_us"] += row["groups_us"]
+            total["gil_us"] += row["gil_us"]
+            total["precb_us"] += row["precb_us"]
+            total["notify_us"] += row["notify_us"]
+            total["coord_pre_us"] += row["coord_pre_us"]
+            total["coord_post_us"] += row["coord_post_us"]
+            total["gpu_in_us"] += row["gpu_in_us"]
+            total["gpu_out_us"] += row["gpu_out_us"]
+            total["h2d_us"] += row["h2d_us"]
             total["compute_us"] += row["compute_us"]
             total["signal_us"] += row["signal_us"]
             total["total_tasks"] += row["tasks"]
@@ -924,6 +1040,7 @@ class CpuMoeExecutor:
         bs: int,
         step_start: torch.cuda.Event,
         step_end: torch.cuda.Event,
+        step_end_host_ns: int | None = None,
     ) -> dict[str, float]:
         """Resolve one synchronized decode replay into phase and overlap spans."""
         step_us = float(step_start.elapsed_time(step_end) * 1000.0)
@@ -963,7 +1080,7 @@ class CpuMoeExecutor:
             # doorbell marker; otherwise its whole native span overlapped hot work.
             cpu_delay_us = max(0.0, branch_us - cpu_us) if branch_us > hot_us else 0.0
             overlap_us += max(0.0, min(cpu_us, hot_us - cpu_delay_us))
-        breakdown = self.step_timing_breakdown(bs)
+        breakdown = self.step_timing_breakdown(bs, step_end, step_end_host_ns)
         native = breakdown["total"]
         cpu_layers = len(breakdown["per_layer"])
         return {
@@ -972,6 +1089,29 @@ class CpuMoeExecutor:
             "cpu_tail_us": max(0.0, cpu_tail_us),
             "overlap_us": max(0.0, overlap_us),
             "cpu_wake_us": native["wake_us"] / cpu_layers if cpu_layers else 0.0,
+            "cpu_groups_us": (
+                native["groups_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_gil_us": native["gil_us"] / cpu_layers if cpu_layers else 0.0,
+            "cpu_precb_us": (
+                native["precb_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_notify_us": (
+                native["notify_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_coord_us": (
+                (native["coord_pre_us"] + native["coord_post_us"]) / cpu_layers
+                if cpu_layers
+                else 0.0
+            ),
+            "cpu_gpu_in_us": (
+                native["gpu_in_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_gpu_out_us": (
+                native["gpu_out_us"] / cpu_layers if cpu_layers else 0.0
+            ),
+            "cpu_d2h_us": breakdown["submit_d2h_us"]["total"],
+            "cpu_h2d_us": native["h2d_us"],
             "cpu_compute_us": (
                 native["compute_us"] / cpu_layers if cpu_layers else 0.0
             ),
@@ -1152,6 +1292,8 @@ class CpuMoeExecutor:
         delta. A layer without history is deliberately absent from the snapshot, so
         its first decode step keeps the existing reactive behavior.
         """
+        if getattr(self, "_moe_cpu_willneed", "always") == "recent":
+            self._update_willneed_fault_guard()
         if not getattr(self, "_disk_lookahead_enabled", False):
             return 0
         previous = getattr(self, "_disk_previous_experts", {})
@@ -1166,6 +1308,54 @@ class CpuMoeExecutor:
         """Make the next decode step cold after a prefill or cache reset boundary."""
         self._disk_previous_experts = {}
         self._disk_predicted_experts = {}
+
+    def _update_willneed_fault_guard(self) -> None:
+        """Advance the rolling major-fault guard at a decode-step boundary."""
+        if self._willneed_guard_steps_remaining > 0:
+            self._willneed_guard_steps_remaining -= 1
+        _, major_now = _process_faults()
+        previous = self._willneed_fault_last_major
+        self._willneed_fault_last_major = major_now
+        if major_now is None or previous is None:
+            return
+        delta = max(0, major_now - previous)
+        pos = self._willneed_fault_window_pos
+        self._willneed_fault_window_sum += delta - self._willneed_fault_window[pos]
+        self._willneed_fault_window[pos] = delta
+        self._willneed_fault_window_pos = (pos + 1) % len(self._willneed_fault_window)
+        self._willneed_fault_window_samples = min(
+            len(self._willneed_fault_window), self._willneed_fault_window_samples + 1
+        )
+        faults_per_step = (
+            self._willneed_fault_window_sum / self._willneed_fault_window_samples
+        )
+        if (
+            self._willneed_guard_steps_remaining == 0
+            and faults_per_step > self._willneed_fault_ceiling
+        ):
+            self._willneed_guard_steps_remaining = _WILLNEED_GUARD_HOLD_STEPS
+            self._willneed_guard_trips += 1
+
+    def _filter_recent_willneed(
+        self, layer_id: int, selected: list[int]
+    ) -> list[int]:
+        """Record touches and retain experts old enough to need WILLNEED."""
+        step = self._willneed_layer_steps[layer_id]
+        self._willneed_layer_steps[layer_id] = step + 1
+        last_touch = self._willneed_last_touch[layer_id]
+        force_always = self._willneed_guard_steps_remaining > 0
+        advised = []
+        skipped = 0
+        for expert in selected:
+            is_recent = step - last_touch[expert] < self._willneed_recent_steps
+            last_touch[expert] = step
+            if force_always or not is_recent:
+                advised.append(expert)
+            else:
+                skipped += 1
+        self._willneed_skipped_experts += skipped
+        self._willneed_advised_experts += len(advised)
+        return advised
 
     def prefetch_experts(
         self,
@@ -1190,6 +1380,9 @@ class CpuMoeExecutor:
             self._disk_distinct_experts += len(selected)
         if is_prefill:
             return self._prefetch_selected(layer_id, selected)
+
+        if self._moe_cpu_willneed == "recent":
+            selected = self._filter_recent_willneed(int(layer_id), selected)
 
         predicted_by_layer = getattr(self, "_disk_predicted_experts", {})
         predicted = predicted_by_layer.pop(int(layer_id), None)
@@ -1467,6 +1660,9 @@ class CpuMoeExecutor:
         self._disk_lookahead_hits = 0
         self._disk_lookahead_routes = 0
         self._disk_delta_pages = 0
+        if getattr(self, "_moe_cpu_willneed", "always") == "recent":
+            self._willneed_skipped_experts = 0
+            self._willneed_advised_experts = 0
         self._prefill_coalesce_experts = 0
         self._prefill_coalesce_ns = 0
         self._prefill_coalesce_degrades = 0
@@ -1517,6 +1713,17 @@ class CpuMoeExecutor:
         result = {
             "prefetch_calls": sum(self._disk_prefetch_calls),
             "pages_requested": sum(self._disk_prefetch_pages),
+            "willneed_skipped_experts": (
+                getattr(self, "_willneed_skipped_experts", 0)
+                if getattr(self, "_moe_cpu_willneed", "always") == "recent"
+                else 0
+            ),
+            "willneed_advised_experts": (
+                getattr(self, "_willneed_advised_experts", 0)
+                if getattr(self, "_moe_cpu_willneed", "always") == "recent"
+                else self._disk_distinct_experts
+            ),
+            "willneed_guard_trips": getattr(self, "_willneed_guard_trips", 0),
             "major_faults": major_faults,
             "major_faults_unit": "kernel_events_4KiB_or_2MiB",
             "major_faults_per_decode_step": (
@@ -1636,6 +1843,9 @@ class CpuMoeExecutor:
             self._disk_lookahead_hits = 0
             self._disk_lookahead_routes = 0
             self._disk_delta_pages = 0
+            if getattr(self, "_moe_cpu_willneed", "always") == "recent":
+                self._willneed_skipped_experts = 0
+                self._willneed_advised_experts = 0
             self._prefill_coalesce_experts = 0
             self._prefill_coalesce_ns = 0
             self._prefill_coalesce_degrades = 0

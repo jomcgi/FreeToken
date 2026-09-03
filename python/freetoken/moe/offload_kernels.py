@@ -98,7 +98,12 @@ def ensure_experts_hybrid(
 
 
 def ensure_experts_hot(
-    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+    cache,
+    layer_id: int,
+    expert_ids: torch.Tensor,
+    *,
+    record_stats: bool = True,
+    route_weight: float = 1.0,
 ) -> None:
     """Current HOT/COLD split for a file-backed DISK layer.
 
@@ -111,9 +116,19 @@ def ensure_experts_hot(
     """
     if not expert_ids.is_cuda:
         return _ensure_experts_hot_cpu(
-            cache, layer_id, expert_ids, record_stats=record_stats
+            cache,
+            layer_id,
+            expert_ids,
+            record_stats=record_stats,
+            route_weight=route_weight,
         )
-    _ensure_experts_hot_gpu(cache, layer_id, expert_ids, record_stats=record_stats)
+    _ensure_experts_hot_gpu(
+        cache,
+        layer_id,
+        expert_ids,
+        record_stats=record_stats,
+        route_weight=route_weight,
+    )
 
 
 def prefill_hit_compact(cache, layer_id: int, buffer_id: int) -> None:
@@ -260,7 +275,12 @@ def _ensure_experts_hybrid_gpu(
 
 
 def _ensure_experts_hot_gpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool
+    cache,
+    layer_id: int,
+    expert_ids: torch.Tensor,
+    *,
+    record_stats: bool,
+    route_weight: float,
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
@@ -284,8 +304,10 @@ def _ensure_experts_hot_gpu(
         cache.num_experts,
         cache.cache_size,
         cache._hot_decay_factor,
+        float(route_weight),
         HOT_ADAPT=cache.hot_adapt_enabled,
         RECORD_STATS=record_stats,
+        WEIGHTED=route_weight != 1.0,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         num_warps=8 if block_c >= 2048 else 4,
@@ -356,7 +378,12 @@ def _ensure_experts_hybrid_cpu(
 
 
 def _ensure_experts_hot_cpu(
-    cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
+    cache,
+    layer_id: int,
+    expert_ids: torch.Tensor,
+    *,
+    record_stats: bool = True,
+    route_weight: float = 1.0,
 ) -> None:
     """CPU reference for the invocation-based HOT/COLD decay and routing rule.
 
@@ -411,6 +438,8 @@ def _ensure_experts_hot_cpu(
         counts = torch.bincount(
             torch.tensor(raw, dtype=torch.long), minlength=cache.num_experts
         ).to(torch.float32)
+        if route_weight != 1.0:
+            counts.mul_(route_weight)
         cache.decayed_decode_freq[layer_id].mul_(cache._hot_decay_factor).add_(counts)
     if record_stats:
         cache.stat_hot_pairs += hot_pairs
@@ -690,8 +719,10 @@ def _ensure_experts_hot_kernel(
     num_experts: tl.constexpr,
     cache_size: tl.constexpr,
     decay_factor,
+    route_weight,
     HOT_ADAPT: tl.constexpr,
     RECORD_STATS: tl.constexpr,
+    WEIGHTED: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
@@ -720,9 +751,12 @@ def _ensure_experts_hot_kernel(
     hot_pairs = tl.sum(tl.where(eligible, route_count, 0))
     if HOT_ADAPT and RECORD_STATS:
         decayed = tl.load(decayed_freq_ptr + base + off_e, mask=e_mask, other=0.0)
+        route_count_fp32 = route_count.to(tl.float32)
+        if WEIGHTED:
+            route_count_fp32 *= route_weight
         tl.store(
             decayed_freq_ptr + base + off_e,
-            decayed * decay_factor + route_count.to(tl.float32),
+            decayed * decay_factor + route_count_fp32,
             mask=e_mask,
         )
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)

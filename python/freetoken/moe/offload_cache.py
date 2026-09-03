@@ -338,6 +338,15 @@ class OffloadMoeCache:
         self.hot_adapt_expert_bytes = 0
         self.hot_adapt_hot_budget_bytes = 0
         self.hot_adapt_boundary_cap_frac = 0.5
+        self.hot_adapt_prefill_weight = 1.0
+        self.hot_adapt_prefill_run_cap_frac = 0.0
+        self.hot_adapt_post_prefill_tick = False
+        self._hot_adapt_prefill_run_swapped_bytes = 0
+        self._hot_adapt_prefill_run_swaps = 0
+        self._hot_adapt_prefill_run_active = False
+        self._hot_adapt_prefill_run_generation = 0
+        self._hot_adapt_tick_prefill_run_generation: int | None = None
+        self._hot_adapt_after_prefill_pending = False
         self._hot_adapt_prefill_tokens_counted = 0
         self._hot_adapt_token_clock = None
         self.hot_adapt_ticks = 0
@@ -1144,6 +1153,9 @@ class OffloadMoeCache:
         max_swap_bytes: int,
         expert_bytes: int,
         boundary_cap_frac: float = 0.5,
+        prefill_weight: float = 1.0,
+        prefill_run_cap_frac: float = 0.0,
+        post_prefill_tick: bool = False,
         persisted_counter_seed: Mapping[int, tuple[float, ...]] | None = None,
         persisted_seeded_layers: frozenset[int] = frozenset(),
         hot_plan_path: str | None = None,
@@ -1168,6 +1180,22 @@ class OffloadMoeCache:
             or not 0 < boundary_cap_frac <= 1
         ):
             raise ValueError("HOT boundary cap fraction must be finite and in (0, 1]")
+        if (
+            isinstance(prefill_weight, bool)
+            or not math.isfinite(prefill_weight)
+            or not 0 <= prefill_weight <= 1
+        ):
+            raise ValueError("HOT prefill weight must be finite and in [0, 1]")
+        if (
+            isinstance(prefill_run_cap_frac, bool)
+            or not math.isfinite(prefill_run_cap_frac)
+            or not 0 <= prefill_run_cap_frac <= 1
+        ):
+            raise ValueError(
+                "HOT prefill run cap fraction must be 0 or finite and in (0, 1]"
+            )
+        if not isinstance(post_prefill_tick, bool):
+            raise ValueError("HOT post-prefill tick must be a boolean")
         if (
             isinstance(idle_ms, bool)
             or not isinstance(idle_ms, int)
@@ -1198,6 +1226,15 @@ class OffloadMoeCache:
             sum(self.hot_expert_capacity.values()) * self.hot_adapt_expert_bytes
         )
         self.hot_adapt_boundary_cap_frac = float(boundary_cap_frac)
+        self.hot_adapt_prefill_weight = float(prefill_weight)
+        self.hot_adapt_prefill_run_cap_frac = float(prefill_run_cap_frac)
+        self.hot_adapt_post_prefill_tick = post_prefill_tick
+        self._hot_adapt_prefill_run_swapped_bytes = 0
+        self._hot_adapt_prefill_run_swaps = 0
+        self._hot_adapt_prefill_run_active = False
+        self._hot_adapt_prefill_run_generation = 0
+        self._hot_adapt_tick_prefill_run_generation = None
+        self._hot_adapt_after_prefill_pending = False
         controller = HotAdaptIntervalController.create(
             interval_steps,
             hot_budget_bytes=self.hot_adapt_hot_budget_bytes,
@@ -1702,7 +1739,12 @@ class OffloadMoeCache:
         return self._hot_mapping_host.tolist()
 
     def _plan_hot_adaptation(
-        self, ready, token: int, boundary: str, tick_count: int,
+        self,
+        ready,
+        token: int,
+        swap_budget_bytes: int | None,
+        boundary: str,
+        tick_count: int,
     ):
         if ready is not None:
             ready.synchronize()
@@ -1727,18 +1769,20 @@ class OffloadMoeCache:
             capacities=self.hot_expert_capacity,
         )
         owners = {layer_id: tuple(rows) for layer_id, rows in self._hot_slot_owners.items()}
-        swaps = plan_hot_swaps(
-            counts,
-            owners,
-            desired,
-            expert_bytes=self.hot_adapt_expert_bytes,
-            max_swap_bytes=hot_catchup_swap_bytes(
+        if swap_budget_bytes is None:
+            swap_budget_bytes = hot_catchup_swap_bytes(
                 self.hot_adapt_max_swap_bytes,
                 self.hot_adapt_expert_bytes,
                 tick_count,
                 hot_budget_bytes=self.hot_adapt_hot_budget_bytes,
                 boundary_cap_frac=self.hot_adapt_boundary_cap_frac,
-            ),
+            )
+        swaps = plan_hot_swaps(
+            counts,
+            owners,
+            desired,
+            expert_bytes=self.hot_adapt_expert_bytes,
+            max_swap_bytes=swap_budget_bytes,
         )
         total = sum(sum(layer) for layer in counts.values())
         hot = sum(
@@ -1852,6 +1896,15 @@ class OffloadMoeCache:
             self.hot_adapt_idle_swaps += len(executed)
         else:
             self.hot_adapt_swaps += len(executed)
+        if (
+            getattr(self, "_hot_adapt_tick_boundary", None) == "prefill"
+            and self._hot_adapt_tick_prefill_run_generation
+            == self._hot_adapt_prefill_run_generation
+        ):
+            self._hot_adapt_prefill_run_swapped_bytes += (
+                len(executed) * self.hot_adapt_expert_bytes
+            )
+            self._hot_adapt_prefill_run_swaps += len(executed)
         self._hot_adapt_tick_executed_swaps = len(executed)
         self._hot_adapt_swaps_pending = ()
         self._hot_adapt_worker_installs = False
@@ -2037,7 +2090,12 @@ class OffloadMoeCache:
         return self._hot_plan_future
 
     def _start_hot_adaptation_tick(
-        self, *, token: int, boundary: str, tick_count: int
+        self,
+        *,
+        token: int,
+        boundary: str,
+        tick_count: int,
+        swap_budget_bytes: int | None = None,
     ) -> None:
         """Snapshot counters and submit one bounded planner boundary."""
         self._hot_adapt_tick_boundary = boundary
@@ -2046,6 +2104,37 @@ class OffloadMoeCache:
         self._hot_adapt_tick_rate_before = 0.0
         self._hot_adapt_tick_interval_tokens = self.hot_adapt_interval_steps
         self._hot_adapt_tick_staged_bytes = 0
+        self._hot_adapt_tick_prefill_run_generation = (
+            getattr(self, "_hot_adapt_prefill_run_generation", 0)
+            if boundary == "prefill" else None
+        )
+        if (
+            boundary == "prefill"
+            and getattr(self, "hot_adapt_prefill_run_cap_frac", 0.0) > 0
+            and swap_budget_bytes is None
+        ):
+            from freetoken.moe.hot_adapt import (
+                hot_catchup_swap_bytes,
+                prefill_run_swap_budget,
+            )
+
+            per_boundary_bytes = hot_catchup_swap_bytes(
+                self.hot_adapt_max_swap_bytes,
+                self.hot_adapt_expert_bytes,
+                tick_count,
+                hot_budget_bytes=self.hot_adapt_hot_budget_bytes,
+                boundary_cap_frac=self.hot_adapt_boundary_cap_frac,
+            )
+            swap_budget_bytes = prefill_run_swap_budget(
+                per_boundary_bytes,
+                self.hot_adapt_expert_bytes,
+                getattr(self, "_hot_adapt_prefill_run_swapped_bytes", 0),
+                hot_budget_bytes=self.hot_adapt_hot_budget_bytes,
+                run_cap_frac=self.hot_adapt_prefill_run_cap_frac,
+            )
+            if swap_budget_bytes == 0:
+                self._complete_hot_adaptation_tick(staging_seconds=0.0)
+                return
         assert self._hot_adapt_snapshot_host is not None
         self._hot_adapt_snapshot_device.copy_(self.decayed_decode_freq)
         ready = None
@@ -2069,6 +2158,7 @@ class OffloadMoeCache:
             self._plan_hot_adaptation,
             ready,
             token,
+            swap_budget_bytes,
             boundary,
             tick_count,
         )
@@ -2110,6 +2200,22 @@ class OffloadMoeCache:
                 continue
             self._poll_hot_adaptation(preempt_idle=True)
 
+    def _begin_hot_adapt_prefill_run(self) -> None:
+        if not getattr(self, "_hot_adapt_prefill_run_active", False):
+            self._hot_adapt_prefill_run_active = True
+            self._hot_adapt_prefill_run_generation = (
+                getattr(self, "_hot_adapt_prefill_run_generation", 0) + 1
+            )
+            self._hot_adapt_prefill_run_swapped_bytes = 0
+            self._hot_adapt_prefill_run_swaps = 0
+        self._hot_adapt_after_prefill_pending = True
+
+    def _end_hot_adapt_prefill_run(self, *, clear_pending: bool) -> None:
+        self._hot_adapt_prefill_run_active = False
+        self._hot_adapt_prefill_run_swapped_bytes = 0
+        if clear_pending:
+            self._hot_adapt_after_prefill_pending = False
+
     def hot_adapt_while_idle(
         self,
         request_pending: Callable[[], bool],
@@ -2133,6 +2239,7 @@ class OffloadMoeCache:
                 self._poll_hot_adaptation()
                 now = time.monotonic()
                 if self._hot_adapt_future is None and tracker.due(now):
+                    self._end_hot_adapt_prefill_run(clear_pending=True)
                     self._hot_adapt_stop_event.clear()
                     tracker.tick_started()
                     self.hot_adapt_ticks += 1
@@ -2201,8 +2308,24 @@ class OffloadMoeCache:
         if self._hot_adapt_window_started_at is None:
             self._hot_adapt_window_started_at = now
         self._poll_hot_adaptation()
+        if boundary == "prefill":
+            self._begin_hot_adapt_prefill_run()
+        else:
+            self._end_hot_adapt_prefill_run(
+                clear_pending=not getattr(
+                    self, "hot_adapt_post_prefill_tick", False
+                )
+            )
         controller = self._hot_adapt_interval_controller
-        if controller is None or clock.routed_tokens < clock.next_tick_token:
+        force_post_prefill = (
+            boundary == "decode"
+            and getattr(self, "hot_adapt_post_prefill_tick", False)
+            and getattr(self, "_hot_adapt_after_prefill_pending", False)
+        )
+        if controller is None or (
+            not force_post_prefill
+            and clock.routed_tokens < clock.next_tick_token
+        ):
             return
         if self._hot_adapt_future is not None:
             if not self._hot_adapt_deferred_logged:
@@ -2213,15 +2336,20 @@ class OffloadMoeCache:
                 )
                 self._hot_adapt_deferred_logged = True
             return
-        tick_count = clock.advance(0)
+        if force_post_prefill:
+            tick_count = 1
+            clock.consume_forced_tick()
+            self._hot_adapt_after_prefill_pending = False
+        else:
+            tick_count = clock.advance(0)
+            for _ in range(tick_count):
+                clock.consume_tick()
         self.hot_adapt_ticks += tick_count
         if boundary == "prefill":
             self.hot_adapt_ticks_prefill += tick_count
         else:
             self.hot_adapt_ticks_decode += tick_count
         self._hot_adapt_deferred_logged = False
-        for _ in range(tick_count):
-            clock.consume_tick()
         if tracker is not None:
             tracker.tick_started()
         self._hot_adapt_tick_covered_seconds = max(
@@ -2232,6 +2360,10 @@ class OffloadMoeCache:
             token=clock.routed_tokens,
             boundary=boundary,
             tick_count=tick_count,
+            swap_budget_bytes=(
+                self.hot_adapt_max_swap_bytes
+                if force_post_prefill else None
+            ),
         )
 
     def hot_adapt_prefill_boundary(self) -> None:
@@ -2672,6 +2804,9 @@ class OffloadMoeCache:
         result["decayed_hot_pair_rate"] = self.decayed_hot_pair_rate()
         result["hot_adapt_interval"] = self.hot_adapt_interval_steps
         result["hot_adapt_ticks_prefill"] = ticks_prefill
+        result["hot_adapt_prefill_run_swaps"] = getattr(
+            self, "_hot_adapt_prefill_run_swaps", 0
+        )
         result["hot_adapt_ticks_decode"] = ticks_decode
         result["hot_adapt_ticks_idle"] = ticks_idle
         pinned_layers = [
@@ -3145,6 +3280,8 @@ class OffloadMoeCache:
         self,
         layer_id: int,
         expert_ids: torch.Tensor,
+        *,
+        route_weight: float = 1.0,
     ) -> int:
         """Route only this DISK layer's current HOT experts through the slot cache.
 
@@ -3164,7 +3301,12 @@ class OffloadMoeCache:
         self.record_decode_frequency(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        ensure_experts_hot(self, layer_id, expert_ids)
+        ensure_experts_hot(
+            self,
+            layer_id,
+            expert_ids,
+            route_weight=route_weight,
+        )
         # The kernel updates hit timestamps for compatibility with ordinary LRU.
         # Restore the permanent sentinel inside graph capture so later layers in
         # the same decode step cannot evict HOT slots.

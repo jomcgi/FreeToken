@@ -589,7 +589,11 @@ class OffloadMoELayer(MoELayer):
     ) -> torch.Tensor:
         """Run resident DISK routes on protected slots and cold routes on CPU."""
         raw_ids = topk_ids.clone()
-        counted_tokens = cache.ensure_experts_hot(self.layer_id, topk_ids)
+        counted_tokens = cache.ensure_experts_hot(
+            self.layer_id,
+            topk_ids,
+            route_weight=cache.hot_adapt_prefill_weight,
+        )
         cache.record_hot_adapt_prefill_tokens(counted_tokens)
         on_gpu, cpu_ids, gpu_slots, gpu_weights = _split_hot_cold_routes(
             raw_ids, topk_ids, topk_weights

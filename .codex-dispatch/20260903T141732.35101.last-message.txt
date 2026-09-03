@@ -1,0 +1,27 @@
+Implemented the wake-timing split and flag-gated pre-callback deferral.
+
+Changed:
+
+- Native timing and callback mode in [cpu_moe_ext.cpp](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp)
+- Python aggregation and executor plumbing in [cpu_executor.py](/Users/jomcgi/repos/ft-worktrees/handoff-timers/python/freetoken/moe/cpu_executor.py)
+- Config, CLI, engine, status rendering, and [CLI docs](/Users/jomcgi/repos/ft-worktrees/handoff-timers/docs/cli.md)
+- All requested test files
+
+Highlights:
+
+- Added groups, GIL, callback, notify, coordinator, and H2D timing fields.
+- Surfaced existing `submit_d2h_us` as `cpu_d2h_us`.
+- Added `--moe-cpu-precb {before,after}`, defaulting to `before`.
+- `after` applies only to coordinator-driven grouped decode. Prefill and host-function paths retain existing ordering.
+- No em-dashes in the diff. No commit created.
+
+Validation:
+
+- Python compilation passed.
+- Ruff checks passed for all touched tests.
+- Isolated GPU-free checks passed: 4 step-timing tests, 16 scheduler-status tests, and the resolve-timing calculation.
+- `git diff --check` passed.
+- Requested pytest could not collect because the available pytest interpreter has no Torch.
+- Extension build could not start because local Python lacks setuptools and Torch headers. Apple Clang is available; all edited C++ hunks were reread, names cross-checked, and braces verified balanced.
+
+Open questions: none. CI still needs to run the full pytest selection and compile the extension in its Torch/CUDA environment.

@@ -514,6 +514,11 @@ class HotAdaptTokenClock:
         self.next_tick_token += self.interval
         return token
 
+    def consume_forced_tick(self) -> int:
+        """Consume a tick now and place the next deadline one interval ahead."""
+        self.next_tick_token = self.routed_tokens
+        return self.consume_tick()
+
     def set_interval(self, interval: int) -> None:
         """Apply a new auto interval without moving the clock backwards."""
         if interval <= 0:
@@ -658,6 +663,37 @@ def hot_catchup_swap_bytes(
     boundary_bound = max(expert_bytes, int(hot_budget_bytes * boundary_cap_frac))
     boundary_bound -= boundary_bound % expert_bytes
     return min(tick_bound, boundary_bound)
+
+
+def prefill_run_swap_budget(
+    per_boundary_bytes: int,
+    expert_bytes: int,
+    swapped_bytes: int,
+    *,
+    hot_budget_bytes: int,
+    run_cap_frac: float,
+) -> int:
+    """Return the row-aligned remaining swap allowance for one prefill run."""
+    if (
+        per_boundary_bytes < 0
+        or expert_bytes <= 0
+        or swapped_bytes < 0
+        or hot_budget_bytes <= 0
+    ):
+        raise ValueError("HOT prefill run swap geometry must be positive")
+    if (
+        isinstance(run_cap_frac, bool)
+        or not math.isfinite(run_cap_frac)
+        or not 0 <= run_cap_frac <= 1
+    ):
+        raise ValueError("HOT prefill run cap fraction must be 0 or finite and in (0, 1]")
+    if run_cap_frac == 0:
+        return per_boundary_bytes
+    cap_bytes = int(hot_budget_bytes * run_cap_frac)
+    cap_bytes -= cap_bytes % expert_bytes
+    remaining_bytes = max(0, cap_bytes - swapped_bytes)
+    budget_bytes = min(per_boundary_bytes, remaining_bytes)
+    return budget_bytes - budget_bytes % expert_bytes
 
 
 def hot_boundary_interval_tokens(

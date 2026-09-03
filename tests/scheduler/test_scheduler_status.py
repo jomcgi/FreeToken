@@ -262,6 +262,15 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
         "cpu_tail_us": 3000,
         "overlap_us": 400,
         "cpu_wake_us": 100,
+        "cpu_groups_us": 20,
+        "cpu_gil_us": 30,
+        "cpu_precb_us": 40,
+        "cpu_notify_us": 10,
+        "cpu_coord_us": 15,
+        "cpu_gpu_in_us": 250,
+        "cpu_gpu_out_us": 350,
+        "cpu_d2h_us": 500,
+        "cpu_h2d_us": 300,
         "cpu_compute_us": 1800,
         "cpu_signal_us": 40,
         "cpu_layers_per_step": 27,
@@ -274,6 +283,15 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
         "cpu_tail_us": 3600,
         "overlap_us": 600,
         "cpu_wake_us": 140,
+        "cpu_groups_us": 30,
+        "cpu_gil_us": 40,
+        "cpu_precb_us": 50,
+        "cpu_notify_us": 20,
+        "cpu_coord_us": 25,
+        "cpu_gpu_in_us": 350,
+        "cpu_gpu_out_us": 450,
+        "cpu_d2h_us": 700,
+        "cpu_h2d_us": 500,
         "cpu_compute_us": 2200,
         "cpu_signal_us": 60,
         "cpu_layers_per_step": 29,
@@ -292,6 +310,15 @@ def test_decode_moe_step_timing_is_averaged_on_status_line():
     assert "cpu_tail_us: 3300" in line
     assert "overlap_us: 500" in line
     assert "cpu_wake_us: 120" in line
+    assert "cpu_groups_us: 25" in line
+    assert "cpu_gil_us: 35" in line
+    assert "cpu_precb_us: 45" in line
+    assert "cpu_notify_us: 15" in line
+    assert "cpu_coord_us: 20" in line
+    assert "cpu_gpu_in_us: 300" in line
+    assert "cpu_gpu_out_us: 400" in line
+    assert "cpu_d2h_us: 600" in line
+    assert "cpu_h2d_us: 400" in line
     assert "cpu_compute_us: 2000" in line
     assert "cpu_signal_us: 50" in line
     assert "cpu_layers_per_step: 28" in line
@@ -307,6 +334,15 @@ def test_decode_line_omits_moe_step_timing_when_disabled():
     for field in (
         "cpu_head_us",
         "cpu_wake_us",
+        "cpu_groups_us",
+        "cpu_gil_us",
+        "cpu_precb_us",
+        "cpu_notify_us",
+        "cpu_coord_us",
+        "cpu_gpu_in_us",
+        "cpu_gpu_out_us",
+        "cpu_d2h_us",
+        "cpu_h2d_us",
         "cpu_compute_us",
         "cpu_signal_us",
         "cpu_layers_per_step",

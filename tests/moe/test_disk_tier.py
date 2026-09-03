@@ -234,6 +234,7 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     cache.hot_adapt_ticks_idle = 2
     cache.hot_adapt_swaps = 1
     cache.hot_adapt_idle_swaps = 2
+    cache._hot_adapt_prefill_run_swaps = 3
 
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_pair_rate"] == pytest.approx(0.7)
@@ -244,6 +245,7 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     assert stats["decayed_hot_pair_rate"] == pytest.approx(0.3)
     assert stats["hot_adapt_interval"] == 17
     assert stats["hot_adapt_ticks_prefill"] == 1
+    assert stats["hot_adapt_prefill_run_swaps"] == 3
     assert stats["hot_adapt_ticks_decode"] == 1
     assert stats["hot_adapt_ticks_idle"] == 2
     assert cache.stat_hot_pairs.item() == 0
@@ -255,6 +257,7 @@ def test_disk_stats_report_hot_pair_rate_and_reset():
     stats = cache.disk_prefetch_stats(reset=True)
     assert stats["hot_swaps_per_interval"] == 0.0
     assert stats["hot_adapt_ticks_prefill"] == 0
+    assert stats["hot_adapt_prefill_run_swaps"] == 3
     assert stats["hot_adapt_ticks_decode"] == 0
     assert stats["hot_adapt_ticks_idle"] == 3
     assert stats["hot_adapt_idle_swaps_per_tick"] == 1.0
@@ -1315,8 +1318,8 @@ def _prefill_hot_split_fixture(
             calls.append(("cpu", topk_ids.clone(), hidden_states.clone()))
             return cpu_output
 
-    def ensure_hot(layer_id, ids):
-        calls.append(("adapt", ids.clone()))
+    def ensure_hot(layer_id, ids, **kwargs):
+        calls.append(("adapt", ids.clone(), kwargs))
         mapping = torch.tensor(hot_slots, dtype=ids.dtype)
         ids.copy_(mapping[ids.long()])
         return int(ids.shape[0])
@@ -1341,6 +1344,7 @@ def _prefill_hot_split_fixture(
         layer_residency=["disk"],
         moe_disk_prefill="cpu",
         moe_prefill_hot_split=split,
+        hot_adapt_prefill_weight=0.25,
         moe_prefill_split_kernel=split_kernel,
         quant_format=quant_format,
         prefill_overlap=False,
@@ -1444,10 +1448,44 @@ def test_prefill_hot_split_populates_and_batches_only_cold_routes(
     assert gpu[3:] == (12, True)
     adaptation = next(call[1] for call in calls if call[0] == "adapt")
     assert adaptation.tolist() == [[0, 1], [2, 3], [0, 3]]
+    assert next(call[2] for call in calls if call[0] == "adapt") == {
+        "route_weight": 0.25
+    }
     assert next(call[1] for call in calls if call[0] == "adapt_tokens") == 3
     stats = next(call for call in calls if call[0] == "stats")
     assert int(stats[2].sum()) == 3
     assert any(call[0] == "slot_tables" for call in calls) is with_slot_tables
+
+
+def test_decode_hot_split_uses_default_route_weight(monkeypatch):
+    from freetoken.distributed import set_tp_info, try_get_tp_info
+    from freetoken.layers.moe import OffloadMoELayer
+
+    if try_get_tp_info() is None:
+        set_tp_info(0, 1)
+    calls = []
+    cache = SimpleNamespace(
+        ensure_experts_hot=lambda layer_id, ids, **kwargs: calls.append(kwargs),
+    )
+    layer = OffloadMoELayer(
+        layer_id=0,
+        num_experts=4,
+        top_k=2,
+        hidden_size=8,
+        intermediate_size=8,
+    )
+    monkeypatch.setattr(
+        layer,
+        "_decode_split_partials",
+        lambda cache, hidden, weights, ids, raw: hidden,
+    )
+    hidden = torch.zeros((1, 8), dtype=torch.bfloat16)
+    weights = torch.ones((1, 2), dtype=torch.float32)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32)
+
+    layer._decode_hot_split(cache, hidden, weights, ids)
+
+    assert calls == [{}]
 
 
 @pytest.mark.parametrize(

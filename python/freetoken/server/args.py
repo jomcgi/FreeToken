@@ -155,6 +155,12 @@ def parse_args(
             )
         return interval
 
+    def _on_off_bool(value: str) -> bool:
+        normalized = value.strip().lower()
+        if normalized not in ("on", "off"):
+            raise argparse.ArgumentTypeError("must be 'on' or 'off'")
+        return normalized == "on"
+
     def _nonnegative_float(value: str) -> float:
         try:
             n = float(value)
@@ -162,6 +168,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be a non-negative number") from exc
         if not math.isfinite(n) or n < 0:
             raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
+    def _positive_float(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a positive number") from exc
+        if not math.isfinite(n) or n <= 0:
+            raise argparse.ArgumentTypeError("must be > 0")
         return n
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
@@ -930,6 +945,37 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-hot-adapt-prefill-weight",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_prefill_weight,
+        help=(
+            "Weight applied to prefill route counts during HOT adaptation "
+            "(default: 1.0)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-prefill-run-cap-frac",
+        type=float,
+        default=ServerArgs.moe_hot_adapt_prefill_run_cap_frac,
+        help=(
+            "Maximum fraction of the HOT budget staged across one prefill run; "
+            "0 disables the run cap (default: 0)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-hot-adapt-post-prefill-tick",
+        type=_on_off_bool,
+        metavar="{on,off}",
+        default=ServerArgs.moe_hot_adapt_post_prefill_tick,
+        help=(
+            "Run one immediate HOT adaptation tick at the first decode boundary "
+            "after prefill (default: off)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-plan-persist",
         choices=["auto", "on", "off"],
         default=ServerArgs.moe_hot_plan_persist,
@@ -1107,6 +1153,43 @@ def parse_args(
             "Measure CPU-head, GPU-middle, CPU-tail, and within-layer CPU/GPU "
             "overlap time for decode steps, and append interval averages to the "
             "decode status line. This diagnostic synchronizes each timed step."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-precb",
+        choices=["before", "after"],
+        default=ServerArgs.moe_cpu_precb,
+        help=(
+            "Run the DISK decode expert-prefetch callback before or after notifying "
+            "CPU workers (default: before)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-willneed",
+        choices=["always", "recent"],
+        default=ServerArgs.moe_cpu_willneed,
+        help=(
+            "Issue WILLNEED for every routed DISK expert or skip recently touched "
+            "experts during decode (default: always)."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-willneed-recent-steps",
+        type=_positive_int,
+        default=ServerArgs.moe_cpu_willneed_recent_steps,
+        help="Decode-step recency window for --moe-cpu-willneed recent (default: 256).",
+    )
+
+    parser.add_argument(
+        "--moe-cpu-willneed-fault-ceiling",
+        type=_positive_float,
+        default=ServerArgs.moe_cpu_willneed_fault_ceiling,
+        help=(
+            "Major faults per decode step that temporarily restores always mode "
+            "(default: 2000)."
         ),
     )
 

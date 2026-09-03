@@ -21,6 +21,7 @@ from freetoken.moe.hot_adapt import (
     finish_hot_swaps,
     hot_boundary_interval_tokens,
     hot_catchup_swap_bytes,
+    prefill_run_swap_budget,
     hot_staging_budget_bytes,
     hot_staging_rows,
     plan_hot_swaps,
@@ -287,6 +288,26 @@ def test_pinned_lru_stats_report_missing_bytes_and_keep_disk_rate(monkeypatch):
     assert stats["pinned_missing_per_step"] == pytest.approx(3.0)
     assert stats["pinned_h2d_bytes_per_step"] == pytest.approx(3 * expert_bytes)
     assert stats["hot_pair_rate"] == pytest.approx(0.5)
+    """Import the CPU kernel mirror with lightweight Triton and flashlib stubs."""
+
+    def jit(fn=None, **_kwargs):
+        return (lambda decorated: decorated) if fn is None else fn
+
+    triton = ModuleType("triton")
+    triton.jit = jit
+    triton_language = ModuleType("triton.language")
+    triton.language = triton_language
+    slot_cache = ModuleType("flashlib.kernels.slot_cache")
+    slot_cache.lru_ensure = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "triton", triton)
+    monkeypatch.setitem(sys.modules, "triton.language", triton_language)
+    monkeypatch.setitem(sys.modules, "flashlib.kernels.slot_cache", slot_cache)
+    monkeypatch.delitem(sys.modules, "freetoken.moe.offload_kernels", raising=False)
+    module = importlib.import_module("freetoken.moe.offload_kernels")
+    try:
+        return module
+    finally:
+        sys.modules.pop("freetoken.moe.offload_kernels", None)
 
 
 @pytest.mark.parametrize(
@@ -512,6 +533,66 @@ def test_boundary_cap_preserves_one_row_partition_progress():
     ) == 4
 
 
+def test_prefill_run_swap_budget_is_row_aligned_and_optional():
+    assert prefill_run_swap_budget(
+        24, 4, 20, hot_budget_bytes=32, run_cap_frac=0.0
+    ) == 24
+    assert prefill_run_swap_budget(
+        24, 4, 4, hot_budget_bytes=32, run_cap_frac=0.5
+    ) == 12
+    assert prefill_run_swap_budget(
+        24, 4, 15, hot_budget_bytes=32, run_cap_frac=0.5
+    ) == 0
+
+
+def test_hot_cpu_counter_route_weight_and_default(monkeypatch):
+    import torch
+
+    kernels = _offload_kernels_without_triton(monkeypatch)
+
+    def make_cache():
+        return SimpleNamespace(
+            num_experts=4,
+            cache_size=4,
+            hot_row_for_expert=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            slot_for_id=torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+            id_of_slot=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
+            usage=torch.zeros(4, dtype=torch.int64),
+            step=torch.zeros((), dtype=torch.int64),
+            active_mask=torch.zeros(4, dtype=torch.int32),
+            evict_slots=torch.empty(4, dtype=torch.int32),
+            src_indices=torch.empty(4, dtype=torch.int32),
+            num_indices=torch.zeros(1, dtype=torch.int64),
+            num_missing_full=torch.zeros(1, dtype=torch.int64),
+            stat_hot_pairs=torch.zeros((), dtype=torch.int64),
+            stat_hot_total_pairs=torch.zeros((), dtype=torch.int64),
+            hot_adapt_enabled=True,
+            _hot_decay_factor=0.5,
+            decayed_decode_freq=torch.full((1, 4), 2.0),
+        )
+
+    weighted = make_cache()
+    kernels.ensure_experts_hot(
+        weighted,
+        0,
+        torch.tensor([[0, 1], [1, 3]], dtype=torch.int32),
+        route_weight=0.25,
+    )
+    assert weighted.decayed_decode_freq[0].tolist() == pytest.approx(
+        [1.25, 1.5, 1.0, 1.25]
+    )
+
+    default = make_cache()
+    kernels.ensure_experts_hot(
+        default,
+        0,
+        torch.tensor([[0, 1], [1, 3]], dtype=torch.int32),
+    )
+    assert default.decayed_decode_freq[0].tolist() == pytest.approx(
+        [2.0, 3.0, 1.0, 2.0]
+    )
+
+
 def test_boundary_routing_counts_prefill_decode_and_deferred_ticks(monkeypatch):
     from concurrent.futures import Future
 
@@ -579,12 +660,109 @@ def test_boundary_routing_counts_prefill_decode_and_deferred_ticks(monkeypatch):
     assert cache._hot_adapt_executor.calls[1][1][-2:] == ("decode", 2)
 
 
+def _post_prefill_boundary_cache(monkeypatch, *, enabled):
+    from concurrent.futures import Future
+
+    import torch
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+
+    class PendingExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def submit(self, fn, *args):
+            self.calls.append((fn, args))
+            return Future()
+
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.hot_adapt_enabled = True
+    cache.hot_adapt_post_prefill_tick = enabled
+    cache.hot_adapt_prefill_run_cap_frac = 0.0
+    cache.hot_adapt_max_swap_bytes = 4
+    cache._hot_adapt_token_clock = HotAdaptTokenClock(10)
+    cache._hot_adapt_interval_controller = HotAdaptIntervalController.create(
+        10, hot_budget_bytes=40, max_swap_bytes=4,
+    )
+    cache.hot_adapt_interval_steps = 10
+    cache.hot_adapt_ticks = 0
+    cache.hot_adapt_ticks_prefill = 0
+    cache.hot_adapt_ticks_decode = 0
+    cache._hot_adapt_prefill_tokens_counted = 0
+    cache._hot_adapt_future = None
+    cache._hot_adapt_phase = None
+    cache._hot_adapt_deferred_logged = False
+    cache._hot_adapt_window_started_at = None
+    cache._hot_adapt_snapshot_host = torch.zeros((1, 1))
+    cache._hot_adapt_snapshot_device = torch.zeros((1, 1))
+    cache.decayed_decode_freq = torch.zeros((1, 1))
+    cache._hot_adapt_tick_interval_tokens = 0
+    cache._hot_adapt_tick_staged_bytes = 0
+    cache.device = torch.device("cpu")
+    cache._hot_adapt_executor = PendingExecutor()
+    cache._protect_hot_slots = lambda: None
+    cache._boost_protected_slots = lambda: None
+    cache._poll_hot_adaptation = lambda: None
+    return cache
+
+
+def test_post_prefill_tick_starts_immediately_and_consumes_clock(monkeypatch):
+    cache = _post_prefill_boundary_cache(monkeypatch, enabled=True)
+
+    cache.record_hot_adapt_prefill_tokens(1)
+    cache.hot_adapt_prefill_boundary()
+    cache.hot_adapt_step_boundary(1)
+
+    assert len(cache._hot_adapt_executor.calls) == 1
+    assert cache._hot_adapt_executor.calls[0][1][-2:] == ("decode", 1)
+    assert cache._hot_adapt_executor.calls[0][1][2] == 4
+    assert cache.hot_adapt_ticks_decode == 1
+    assert cache._hot_adapt_token_clock.next_tick_token == 12
+    cache._hot_adapt_future = None
+    cache._hot_adapt_phase = None
+    cache.hot_adapt_step_boundary(9)
+    assert len(cache._hot_adapt_executor.calls) == 1
+
+
+def test_post_prefill_tick_flag_off_preserves_interval_wait(monkeypatch):
+    cache = _post_prefill_boundary_cache(monkeypatch, enabled=False)
+
+    cache.record_hot_adapt_prefill_tokens(1)
+    cache.hot_adapt_prefill_boundary()
+    cache.hot_adapt_step_boundary(1)
+
+    assert cache._hot_adapt_executor.calls == []
+    assert cache.hot_adapt_ticks_decode == 0
+
+
+def test_post_prefill_tick_defers_while_work_is_in_flight(monkeypatch):
+    from concurrent.futures import Future
+
+    cache = _post_prefill_boundary_cache(monkeypatch, enabled=True)
+    cache.record_hot_adapt_prefill_tokens(1)
+    cache.hot_adapt_prefill_boundary()
+    cache._hot_adapt_future = Future()
+    cache._hot_adapt_phase = "plan"
+
+    cache.hot_adapt_step_boundary(1)
+
+    assert cache._hot_adapt_executor.calls == []
+    assert cache._hot_adapt_after_prefill_pending
+    assert cache.hot_adapt_ticks_decode == 0
+
+    cache._hot_adapt_future = None
+    cache._hot_adapt_phase = None
+    cache.hot_adapt_step_boundary(1)
+    assert len(cache._hot_adapt_executor.calls) == 1
+    assert not cache._hot_adapt_after_prefill_pending
+
+
 def test_hot_ensure_returns_token_rows_for_prefill_clock(monkeypatch):
     import torch
 
     OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
     kernels = ModuleType("freetoken.moe.offload_kernels")
-    kernels.ensure_experts_hot = lambda cache, layer_id, expert_ids: None
+    kernels.ensure_experts_hot = lambda cache, layer_id, expert_ids, **kwargs: None
     monkeypatch.setitem(sys.modules, "freetoken.moe.offload_kernels", kernels)
 
     cache = OffloadMoeCache.__new__(OffloadMoeCache)
@@ -796,6 +974,8 @@ def _idle_test_cache(
     *,
     max_swap_rows=1,
     seeded=(),
+    hot_capacity=2,
+    interval_steps="auto",
     idle_ms=1,
     configure_logs=None,
     **configure_kwargs,
@@ -819,7 +999,7 @@ def _idle_test_cache(
     cache = OffloadMoeCache(
         num_layers=1,
         num_experts=4,
-        cache_size=6,
+        cache_size=4 + hot_capacity,
         device=torch.device("cpu"),
         prefill_overlap=False,
         decode_target="cpu",
@@ -829,11 +1009,11 @@ def _idle_test_cache(
         sources,
         layer_residency=[HostResidency.DISK.value],
         hot_expert_ids={0: seeded},
-        hot_expert_capacity={0: 2},
+        hot_expert_capacity={0: hot_capacity},
     )
     cache.configure_hot_adaptation(
         half_life_steps=2,
-        interval_steps="auto",
+        interval_steps=interval_steps,
         max_swap_bytes=max_swap_rows * expert_bytes,
         expert_bytes=expert_bytes,
         boundary_cap_frac=1.0,
@@ -842,6 +1022,48 @@ def _idle_test_cache(
         **configure_kwargs,
     )
     return cache
+
+
+def test_prefill_run_cap_limits_consecutive_boundaries_and_decode_resets(
+    monkeypatch,
+):
+    cache = _idle_test_cache(
+        monkeypatch,
+        hot_capacity=4,
+        interval_steps=1,
+        idle_ms=0,
+        prefill_run_cap_frac=0.5,
+    )
+
+    def finish_tick():
+        while cache._hot_adapt_future is not None:
+            cache._hot_adapt_future.result(timeout=5)
+            cache._poll_hot_adaptation()
+
+    try:
+        cache.decayed_decode_freq[0].copy_(
+            cache.decayed_decode_freq.new_tensor([4.0, 3.0, 2.0, 1.0])
+        )
+        for expected_swaps in (1, 2):
+            cache.record_hot_adapt_prefill_tokens(1)
+            cache.hot_adapt_prefill_boundary()
+            finish_tick()
+            assert cache._hot_adapt_prefill_run_swaps == expected_swaps
+
+        cache.record_hot_adapt_prefill_tokens(1)
+        cache.hot_adapt_prefill_boundary()
+        assert cache._hot_adapt_future is None
+        assert cache.hot_adapt_ticks_prefill == 3
+        assert cache._hot_adapt_prefill_run_swaps == 2
+        assert cache._hot_adapt_prefill_run_swapped_bytes == (
+            2 * cache.hot_adapt_expert_bytes
+        )
+
+        cache.hot_adapt_step_boundary(0)
+        assert cache._hot_adapt_prefill_run_swapped_bytes == 0
+        assert cache._hot_adapt_prefill_run_swaps == 2
+    finally:
+        cache.shutdown_hot_adaptation()
 
 
 def test_idle_ticks_fill_partition_without_advancing_token_clock(monkeypatch):

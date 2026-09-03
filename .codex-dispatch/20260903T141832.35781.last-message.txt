@@ -1,0 +1,23 @@
+Implemented all three HOT-adaptation knobs with default behavior preserved.
+
+Changed:
+
+- Added CLI/config fields, validation, engine plumbing, dense defaults, and QUICKSTART documentation.
+- Added weighted prefill counters with CPU no-op at `1.0` and Triton `WEIGHTED` constexpr gating.
+- Added row-aligned prefill-run swap caps, per-run accounting, stats, and scheduler status output.
+- Added immediate post-prefill decode ticks with in-flight deferral and correct clock consumption.
+- Added GPU-free tests for kernels, phase plumbing, run caps, forced ticks, stats, config, and CLI.
+
+Key files include [offload_cache.py](/Users/jomcgi/repos/ft-worktrees/hot-adapt-phase/python/freetoken/moe/offload_cache.py), [offload_kernels.py](/Users/jomcgi/repos/ft-worktrees/hot-adapt-phase/python/freetoken/moe/offload_kernels.py), [hot_adapt.py](/Users/jomcgi/repos/ft-worktrees/hot-adapt-phase/python/freetoken/moe/hot_adapt.py), and [QUICKSTART.md](/Users/jomcgi/repos/ft-worktrees/hot-adapt-phase/QUICKSTART.md).
+
+Verification:
+
+- HOT adaptation, persistence, and scheduler tests: `90 passed, 3 skipped`
+- Engine config suite under the Mac no-Triton import stub: `116 passed`
+- All changed disk/config cases under the stub: `22 passed`
+- New CLI plumbing test under the stub: `1 passed`
+- Undefined-name lint and `git diff --check`: passed
+- No em-dashes in the diff
+- Exact aggregate command cannot collect `test_moe_cpu_layers.py` or `test_parser_auto_selection.py` on this Mac because Triton is unavailable. The disk suite similarly reports 43 Triton import failures, with 37 passing and 7 CUDA skips.
+
+No commit was created. Open questions: none.
