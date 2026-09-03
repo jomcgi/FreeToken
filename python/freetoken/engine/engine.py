@@ -713,9 +713,12 @@ class Engine:
                 "--moe-cache-auto is not supported for models with a custom "
                 "make_offload_moe_cache; pass --moe-cache-size explicitly."
             )
-        if cache_factory is not None and config.moe_hot_expert_budget_gib > 0:
+        if cache_factory is not None and (
+            config.moe_hot_expert_budget_gib > 0
+            or getattr(config, "moe_pinned_hot_budget_gib", 0.0) > 0
+        ):
             raise NotImplementedError(
-                "--moe-hot-expert-budget-gib requires the standard FTW expert-bank "
+                "MoE HOT expert budgets require the standard FTW expert-bank "
                 "loader; this model provides a custom MoE cache"
             )
         # decode_target picks the bank layout + the per-decode mechanism:
@@ -903,6 +906,15 @@ class Engine:
                     config,
                     disk_layer_ids,
                     num_moe_layers,
+                    pinned_layer_ids=frozenset(
+                        layer_id
+                        for layer_id, residency in enumerate(
+                            banks.layer_residency
+                            or ["pinned"] * num_moe_layers
+                        )
+                        if residency == "pinned"
+                        and layer_id not in cpu_layer_ids
+                    ),
                 )
             )
             hot_expert_ids, hot_plan_seed, hot_plan_runtime = (
@@ -2233,26 +2245,28 @@ def _load_hot_expert_profile(
 
 def _plan_hot_experts(
     expert_hits: dict[int, tuple[int, ...]],
-    disk_layer_ids: frozenset[int],
+    hot_layer_ids: frozenset[int],
     *,
     budget_bytes: int,
     expert_bytes: int,
     num_experts: int,
+    capacities: dict[int, int] | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Select the same top-N experts in each DISK layer under a byte budget.
+    """Select the requested top experts in each protected layer.
 
     Counts rank descending with expert id as the stable tie-break. Any remainder
-    smaller than one expert in every DISK layer is deliberately left unused so the
+    smaller than one expert in every protected layer is deliberately left unused so the
     partition keeps the documented per-layer top-N shape.
     """
     from freetoken.moe.hot_adapt import recompute_hot_partition
 
     return recompute_hot_partition(
         expert_hits,
-        disk_layer_ids,
+        hot_layer_ids,
         budget_bytes=budget_bytes,
         expert_bytes=expert_bytes,
         num_experts=num_experts,
+        capacities=capacities,
     )
 
 
@@ -2312,7 +2326,8 @@ def _resolve_persisted_hot_plan(
             f"MoE HOT plan persistence: read=off, write=off, tier_commit={tier_commit}"
         )
         logger.info_rank0(
-            "MoE HOT plan source: static profile, age=n/a, layers_seeded=0, "
+            f"MoE HOT plan source: static profile, age=n/a, "
+            f"layers_seeded=0/{len(capacity)}, "
             "counters_seeded=no"
         )
         return static_plan, None, runtime
@@ -2335,7 +2350,8 @@ def _resolve_persisted_hot_plan(
             f"tier_commit={tier_commit}"
         )
         logger.info_rank0(
-            "MoE HOT plan source: static profile, age=n/a, layers_seeded=0, "
+            f"MoE HOT plan source: static profile, age=n/a, "
+            f"layers_seeded=0/{len(capacity)}, "
             "counters_seeded=no"
         )
         return static_plan, None, runtime
@@ -2372,7 +2388,8 @@ def _resolve_persisted_hot_plan(
         )
     if seed is None:
         logger.info_rank0(
-            "MoE HOT plan source: static profile, age=n/a, layers_seeded=0, "
+            f"MoE HOT plan source: static profile, age=n/a, "
+            f"layers_seeded=0/{len(capacity)}, "
             "counters_seeded=no"
         )
         return static_plan, None, runtime
@@ -2383,7 +2400,7 @@ def _resolve_persisted_hot_plan(
         )
     logger.info_rank0(
         f"MoE HOT plan source: persisted file {path!r}, age={seed.age_seconds:.0f}s, "
-        f"layers_seeded={len(seed.seeded_layers)}/{len(disk_layer_ids)}, "
+        f"layers_seeded={len(seed.seeded_layers)}/{len(capacity)}, "
         f"counters_seeded={'yes' if seed.counters else 'no'}, "
         f"plan was saved at {seed.saved_hot_budget_bytes} byte budget, "
         f"current is {current_hot_budget_bytes}, "
@@ -2398,23 +2415,37 @@ def _resolve_hot_expert_setup(
     num_moe_layers: int,
     *,
     reserved: int = 0,
+    pinned_layer_ids: frozenset[int] | None = None,
 ) -> tuple[dict[int, tuple[int, ...]], dict[int, int], int]:
     """Resolve initial rows, fixed capacity, and logical bytes per HOT row."""
     # Retain the old keyword for compatibility. HOT rows consume GPU slots now,
     # so host-side reservations do not reduce their capacity.
     _ = reserved
-    requested = int(config.moe_hot_expert_budget_gib * 2**30)
-    if requested <= 0:
+    disk_requested = int(config.moe_hot_expert_budget_gib * 2**30)
+    pinned_requested = int(
+        getattr(config, "moe_pinned_hot_budget_gib", 0.0) * 2**30
+    )
+    if disk_requested <= 0 and pinned_requested <= 0:
         return {}, {}, 0
-    if not disk_layer_ids:
+    if disk_requested > 0 and not disk_layer_ids:
         raise ValueError("--moe-hot-expert-budget-gib requires at least one DISK layer")
-    if config.moe_disk_decode != "cpu":
+    if disk_requested > 0 and config.moe_disk_decode != "cpu":
         raise ValueError(
             "--moe-hot-expert-budget-gib requires --moe-disk-decode cpu"
+        )
+    pinned_layer_ids = frozenset(pinned_layer_ids or ())
+    if pinned_requested > 0 and not pinned_layer_ids:
+        raise ValueError(
+            "--moe-pinned-hot-budget-gib requires at least one PINNED layer"
         )
     interval = getattr(config, "moe_hot_adapt_interval_steps", "auto")
     adapt_enabled = interval == "auto" or interval > 0
     if not config.moe_disk_layer_profile and not adapt_enabled:
+        if pinned_requested > 0:
+            raise ValueError(
+                "static MoE HOT expert budgets require --moe-disk-layer-profile; "
+                "set --moe-hot-adapt-interval-steps above 0 to warm up from all-cold"
+            )
         raise ValueError(
             "static --moe-hot-expert-budget-gib requires --moe-disk-layer-profile; "
             "set --moe-hot-adapt-interval-steps above 0 to warm up from all-cold"
@@ -2471,18 +2502,82 @@ def _resolve_hot_expert_setup(
         overlap_layer_slots + top_k * pinned_layers,
     )
     available_slots = max(0, num_slots - fetch_reserve)
-    budget_limit = min(
-        num_experts,
-        requested // (expert_bytes * num_disk_layers),
+    if pinned_requested <= 0:
+        budget_limit = min(
+            num_experts,
+            disk_requested // (expert_bytes * num_disk_layers),
+        )
+        if budget_limit <= 0:
+            logger.warning_rank0(
+                "HOT expert budget cannot fit one expert in every DISK layer; "
+                "expert-granular residency is disabled"
+            )
+            return {}, {}, expert_bytes
+        slot_limit = min(num_experts, available_slots // num_disk_layers)
+        if slot_limit <= 0:
+            refusal = (
+                "MoE HOT expert plan refused: slot bound cannot fit one protected "
+                f"row in each of {num_disk_layers} DISK layers; "
+                f"moe_cache_size={num_slots}, fetch_reserve={fetch_reserve} "
+                f"(dynamic_floor={dynamic_floor}, overlap_layer_slots="
+                f"{overlap_layer_slots}, top_k={top_k}, pinned_layers={pinned_layers}), "
+                f"available_slots={available_slots}, required_hot_slots={num_disk_layers}"
+            )
+            logger.warning_rank0(refusal)
+            raise ValueError(refusal)
+        top_n = min(budget_limit, slot_limit)
+        capacity = {layer_id: top_n for layer_id in sorted(disk_layer_ids)}
+        actual = top_n * len(capacity) * expert_bytes
+        if budget_limit < slot_limit:
+            bound_source = "budget"
+        elif slot_limit < budget_limit:
+            bound_source = "slots"
+        else:
+            bound_source = "budget+slots"
+        bound_log = (
+            f"bound={bound_source} (budget_limit={budget_limit}, "
+            f"slot_limit={slot_limit}, slots={num_slots}, fetch_reserve={fetch_reserve})"
+        )
+        if hits is None:
+            plan = {layer_id: () for layer_id in sorted(disk_layer_ids)}
+            logger.info_rank0(
+                f"MoE HOT expert plan: all-cold startup with {top_n}/{num_experts} row "
+                f"capacity in each of {len(plan)} DISK layers, {actual / 2**30:.2f} GiB "
+                f"protected GPU, {bound_log}; online adaptation will warm the partition"
+            )
+        else:
+            plan = _plan_hot_experts(
+                hits,
+                disk_layer_ids,
+                budget_bytes=actual,
+                expert_bytes=expert_bytes,
+                num_experts=num_experts,
+            )
+            logger.info_rank0(
+                f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
+                f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB protected GPU, "
+                f"{bound_log}, profiled hot_pair_rate="
+                f"{_profiled_hot_pair_rate(hits, plan):.1%}"
+            )
+        return plan, capacity, expert_bytes
+
+    disk_budget_limit = (
+        min(
+            num_experts,
+            disk_requested // (expert_bytes * num_disk_layers),
+        )
+        if num_disk_layers else 0
     )
-    if budget_limit <= 0:
+    if disk_requested > 0 and disk_budget_limit <= 0:
         logger.warning_rank0(
             "HOT expert budget cannot fit one expert in every DISK layer; "
             "expert-granular residency is disabled"
         )
-        return {}, {}, expert_bytes
-    slot_limit = min(num_experts, available_slots // num_disk_layers)
-    if slot_limit <= 0:
+    disk_slot_limit = (
+        min(num_experts, available_slots // num_disk_layers)
+        if num_disk_layers else 0
+    )
+    if disk_requested > 0 and disk_slot_limit <= 0:
         refusal = (
             "MoE HOT expert plan refused: slot bound cannot fit one protected "
             f"row in each of {num_disk_layers} DISK layers; "
@@ -2493,37 +2588,69 @@ def _resolve_hot_expert_setup(
         )
         logger.warning_rank0(refusal)
         raise ValueError(refusal)
-    top_n = min(budget_limit, slot_limit)
-    capacity = {layer_id: top_n for layer_id in sorted(disk_layer_ids)}
-    actual = top_n * len(capacity) * expert_bytes
-    if budget_limit < slot_limit:
+    disk_top_n = min(disk_budget_limit, disk_slot_limit)
+    capacity = {
+        layer_id: disk_top_n
+        for layer_id in sorted(disk_layer_ids)
+        if disk_top_n > 0
+    }
+    disk_slots = disk_top_n * num_disk_layers
+    pinned_slots_available = max(0, available_slots - disk_slots)
+    num_pinned_hot_layers = len(pinned_layer_ids)
+    pinned_budget_limit = (
+        min(
+            num_experts,
+            pinned_requested // (expert_bytes * num_pinned_hot_layers),
+        )
+        if num_pinned_hot_layers else 0
+    )
+    pinned_slot_limit = (
+        min(num_experts, pinned_slots_available // num_pinned_hot_layers)
+        if num_pinned_hot_layers else 0
+    )
+    pinned_top_n = min(pinned_budget_limit, pinned_slot_limit)
+    if pinned_requested > 0 and pinned_top_n <= 0:
+        logger.warning_rank0(
+            "PINNED HOT expert budget or shared slot bound cannot fit one expert "
+            "in every PINNED layer; expert-granular residency is disabled"
+        )
+    capacity.update(
+        {
+            layer_id: pinned_top_n
+            for layer_id in sorted(pinned_layer_ids)
+            if pinned_top_n > 0
+        }
+    )
+    actual = sum(capacity.values()) * expert_bytes
+    if disk_budget_limit < disk_slot_limit:
         bound_source = "budget"
-    elif slot_limit < budget_limit:
+    elif disk_slot_limit < disk_budget_limit:
         bound_source = "slots"
     else:
         bound_source = "budget+slots"
     bound_log = (
-        f"bound={bound_source} (budget_limit={budget_limit}, "
-        f"slot_limit={slot_limit}, slots={num_slots}, fetch_reserve={fetch_reserve})"
+        f"bound={bound_source} (budget_limit={disk_budget_limit}, "
+        f"slot_limit={disk_slot_limit}, slots={num_slots}, fetch_reserve={fetch_reserve})"
     )
     if hits is None:
-        plan = {layer_id: () for layer_id in sorted(disk_layer_ids)}
+        plan = {layer_id: () for layer_id in sorted(capacity)}
         logger.info_rank0(
-            f"MoE HOT expert plan: all-cold startup with {top_n}/{num_experts} row "
-            f"capacity in each of {len(plan)} DISK layers, {actual / 2**30:.2f} GiB "
+            f"MoE HOT expert plan: all-cold startup across {len(plan)} layers, "
+            f"{actual / 2**30:.2f} GiB "
             f"protected GPU, {bound_log}; online adaptation will warm the partition"
         )
     else:
         plan = _plan_hot_experts(
             hits,
-            disk_layer_ids,
+            frozenset(capacity),
             budget_bytes=actual,
             expert_bytes=expert_bytes,
             num_experts=num_experts,
+            capacities=capacity,
         )
         logger.info_rank0(
-            f"MoE HOT expert plan: top {top_n}/{num_experts} experts in each of "
-            f"{len(plan)} DISK layers, {actual / 2**30:.2f} GiB protected GPU, "
+            f"MoE HOT expert plan: protected experts across {len(plan)} layers, "
+            f"{actual / 2**30:.2f} GiB protected GPU, "
             f"{bound_log}, profiled hot_pair_rate="
             f"{_profiled_hot_pair_rate(hits, plan):.1%}"
         )
@@ -2607,6 +2734,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_disk_layers": None,
     "moe_disk_layer_profile": None,
     "moe_hot_expert_budget_gib": 0.0,
+    "moe_pinned_hot_budget_gib": 0.0,
     "moe_hot_adapt_halflife_steps": 2000,
     "moe_hot_adapt_interval_steps": "auto",
     "moe_hot_adapt_max_swap_gib": 0.5,
@@ -2965,6 +3093,13 @@ def _adjust_config(config: EngineConfig):
             logger.info_rank0(
                 "No MoE cache sizing flag given; defaulting to --moe-cache-auto for "
                 f"auto-selected backend {config.moe_backend!r}"
+            )
+
+    if is_moe and getattr(config, "moe_pinned_hot_budget_gib", 0.0) > 0:
+        if config.moe_backend != "offload":
+            raise ValueError(
+                "--moe-pinned-hot-budget-gib requires --moe-backend offload "
+                f"(got {config.moe_backend!r})"
             )
 
     # EngineConfig can only reject this combination when the parser already knows that

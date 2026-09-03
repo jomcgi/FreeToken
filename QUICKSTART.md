@@ -94,6 +94,7 @@ ft serve \
   --moe-disk-prefill cpu \
   --ple-backend hmm \
   --moe-hot-expert-budget-gib 6 \
+  --moe-pinned-hot-budget-gib 0 \
   --moe-hot-adapt-interval-steps auto \
   --moe-hot-plan-persist auto \
   --moe-hot-plan-dir models/flash-e2m1.ftw \
@@ -119,6 +120,12 @@ What each line does:
   the disk layers are pinned and go through the GPU slot cache; the cold tail
   stays on CPU decode. 6 GiB was the optimum in a two-dimensional sweep with a
   40 GB pin budget; 44/4 and 36/8 both lose.
+- `--moe-pinned-hot-budget-gib N`: optionally reserves `N` GiB of the same
+  protected GPU slot pool for frequently routed experts from PINNED layers.
+  Misses still refill from pinned host memory through the normal offload path.
+  The default is zero, which preserves the original DISK-only hot set. With
+  `--moe-collect-stats`, status reports protected hit coverage plus PINNED
+  misses and PCIe bytes per decode step.
 - `--moe-hot-adapt-interval-steps auto` with `--moe-collect-stats`: the hot
   set follows the traffic. The interval is measured in routed tokens, shared
   by counted HOT-split prefill chunks and decode batches. The automatic default

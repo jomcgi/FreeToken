@@ -62,6 +62,18 @@ def _moe_oracle_status_fragment(disk: dict) -> str:
     )
 
 
+def _pinned_hot_status_fragment(stats: dict) -> str:
+    """Format PINNED-layer protected hits and PCIe refetch traffic."""
+    if "pinned_missing_per_step" not in stats:
+        return ""
+    return (
+        f", pinned_hot_pair_rate: {stats.get('pinned_hot_pair_rate', 0.0):.2%}, "
+        f"pinned_missing/step: {stats['pinned_missing_per_step']:.2f}, "
+        f"pinned_h2d_mb/step: "
+        f"{stats.get('pinned_h2d_bytes_per_step', 0.0) / 2**20:.2f}"
+    )
+
+
 # For overlap scheduling, we also need to cache some other data to avoid IMA
 class ForwardInput(NamedTuple):
     batch: Batch
@@ -224,7 +236,7 @@ class Scheduler(SchedulerIOMixin):
                 self.engine.model.ple_disk_stats(reset=True)
                 if is_ple_status and hasattr(self.engine.model, "ple_disk_stats") else {}
             )
-            if disk:
+            if "prefetch_calls" in disk:
                 message += (
                     f", disk prefetch calls: {disk['prefetch_calls']}, "
                     f"disk pages requested: {disk['pages_requested']}, "
@@ -302,6 +314,7 @@ class Scheduler(SchedulerIOMixin):
                         f"uffd evictions: {disk['evictions']}, "
                         f"uffd resident GiB: {disk['resident_bytes'] / 2**30:.2f}"
                     )
+            message += _pinned_hot_status_fragment(disk)
             if ple_stats:
                 message += (
                     f", ple_prefetch_pages: {ple_stats['ple_prefetch_pages']}, "

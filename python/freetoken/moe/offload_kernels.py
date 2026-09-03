@@ -42,6 +42,41 @@ def ensure_experts(
     )
 
 
+def bump_decayed_freq(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
+    """Decay and add one PINNED HOT layer's decode routes."""
+    if not expert_ids.is_cuda:
+        _bump_decayed_freq_cpu(
+            cache.decayed_decode_freq[layer_id],
+            expert_ids,
+            cache._hot_decay_factor,
+            cache.num_experts,
+        )
+        return
+    block_e = triton.next_power_of_2(cache.num_experts)
+    _bump_decayed_freq_kernel[(1,)](
+        cache.decayed_decode_freq[layer_id],
+        expert_ids,
+        expert_ids.numel(),
+        cache._hot_decay_factor,
+        cache.num_experts,
+        BLOCK_E=block_e,
+    )
+
+
+def _bump_decayed_freq_cpu(
+    decayed_freq: torch.Tensor,
+    expert_ids: torch.Tensor,
+    decay_factor: float,
+    num_experts: int,
+) -> None:
+    """CPU reference for the PINNED HOT decay-and-add kernel."""
+    raw = expert_ids.reshape(-1).long()
+    counts = torch.bincount(raw, minlength=num_experts).to(
+        device=decayed_freq.device, dtype=decayed_freq.dtype
+    )
+    decayed_freq.mul_(decay_factor).add_(counts)
+
+
 def ensure_experts_hybrid(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, fetch_fraction: float = 0.0
 ) -> None:
@@ -386,6 +421,30 @@ def _ensure_experts_hot_cpu(
             int(cache.slot_for_id[layer_id, expert].item())
             if hot_row[expert] >= 0 else -1
         )
+
+
+@triton.jit(do_not_specialize=["num_active"])
+def _bump_decayed_freq_kernel(
+    decayed_freq_ptr,
+    expert_ids_ptr,
+    num_active,
+    decay_factor,
+    num_experts: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    """Apply one invocation decay, then add all routed expert counts."""
+    off_e = tl.arange(0, BLOCK_E)
+    mask = off_e < num_experts
+    route_count = tl.zeros((BLOCK_E,), dtype=tl.int32)
+    for i in tl.range(num_active):
+        expert = tl.load(expert_ids_ptr + i)
+        route_count += (off_e == expert).to(tl.int32)
+    decayed = tl.load(decayed_freq_ptr + off_e, mask=mask, other=0.0)
+    tl.store(
+        decayed_freq_ptr + off_e,
+        decayed * decay_factor + route_count.to(tl.float32),
+        mask=mask,
+    )
 
 
 def _materialize_layer_gpu(cache, layer_id: int) -> None:

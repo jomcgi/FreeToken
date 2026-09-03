@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from freetoken.scheduler.status import SchedulerStatusReporter, _usage_ratio
+from freetoken.scheduler.scheduler import _pinned_hot_status_fragment
 
 
 def _reporter(interval=40):
@@ -33,6 +34,17 @@ def _prefill_batch(new_tokens, cached_tokens, n_seqs):
 
 def _decode_batch(n):
     return SimpleNamespace(is_prefill=False, is_decode=True, reqs=[_req(1, 0) for _ in range(n)])
+
+
+def test_pinned_hot_status_fragment_renders_protected_and_refetch_stats():
+    fragment = _pinned_hot_status_fragment({
+        "pinned_hot_pair_rate": 0.75,
+        "pinned_missing_per_step": 12.5,
+        "pinned_h2d_bytes_per_step": 3.25 * 2**20,
+    })
+    assert "pinned_hot_pair_rate: 75.00%" in fragment
+    assert "pinned_missing/step: 12.50" in fragment
+    assert "pinned_h2d_mb/step: 3.25" in fragment
 
 
 def test_prefill_line_reports_tokens_and_throughput():

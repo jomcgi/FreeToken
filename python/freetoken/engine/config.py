@@ -88,6 +88,9 @@ class EngineConfig:
     # Protected GPU HOT row capacity for DISK layers. A profile seeds the rows;
     # without one, online adaptation starts the fixed partition all-cold.
     moe_hot_expert_budget_gib: float = 0.0
+    # Protected GPU HOT row capacity for PINNED layers. These rows share the
+    # protected slot range and adaptation machinery with DISK HOT rows.
+    moe_pinned_hot_budget_gib: float = 0.0
     # Online HOT-set adaptation. "auto" derives the fill cadence from the HOT
     # allocation and swap bound; an integer retains a fixed cadence, with 0 off.
     moe_hot_adapt_halflife_steps: int = 2000
@@ -337,6 +340,13 @@ class EngineConfig:
         ):
             raise ValueError(
                 "--moe-hot-expert-budget-gib must be a finite non-negative number"
+            )
+        if (
+            not math.isfinite(float(self.moe_pinned_hot_budget_gib))
+            or self.moe_pinned_hot_budget_gib < 0
+        ):
+            raise ValueError(
+                "--moe-pinned-hot-budget-gib must be a finite non-negative number"
             )
         if (
             isinstance(self.moe_hot_adapt_halflife_steps, bool)

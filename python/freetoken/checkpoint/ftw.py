@@ -563,11 +563,17 @@ def load_ftw_banks(
     }
     for layer_id, expert_ids in hot_expert_ids.items():
         hot_expert_capacity.setdefault(layer_id, len(expert_ids))
-    invalid_hot_layers = (set(hot_expert_ids) | set(hot_expert_capacity)) - disk_layers
+    hot_eligible_layers = {
+        i for i, label in enumerate(residency)
+        if label in (HostResidency.DISK.value, HostResidency.PINNED.value)
+    }
+    invalid_hot_layers = (
+        set(hot_expert_ids) | set(hot_expert_capacity)
+    ) - hot_eligible_layers
     if invalid_hot_layers:
         reader.close()
         raise ValueError(
-            f"HOT expert rows are only valid for DISK layers, got layers "
+            f"HOT expert rows are only valid for DISK or PINNED layers, got layers "
             f"{sorted(invalid_hot_layers)}"
         )
     if any(capacity <= 0 for capacity in hot_expert_capacity.values()):
@@ -736,7 +742,7 @@ def load_ftw_banks(
             views.append(raw.view(num_experts, *row_shape) if row_shape else raw.view(num_experts))
         sources[name] = views
 
-    # HOT rows remain authoritative in the DISK banks. OffloadMoeCache streams
+    # HOT rows remain authoritative in the DISK or PINNED banks. OffloadMoeCache streams
     # seeds and later replacements through its bounded pinned staging area into
     # protected GPU slots, so the loader must not create a full host mirror.
     for layer_id, capacity in sorted(hot_expert_capacity.items()):

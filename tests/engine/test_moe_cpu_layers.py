@@ -19,6 +19,7 @@ from freetoken.engine.engine import _load_hot_expert_profile as load_hot_profile
 from freetoken.engine.engine import _plan_hot_experts as plan_hot
 from freetoken.engine.engine import _profiled_hot_pair_rate as profiled_hot_rate
 from freetoken.engine.engine import _resolve_hot_expert_sets as resolve_hot
+from freetoken.engine.engine import _resolve_hot_expert_setup as resolve_hot_setup
 from freetoken.engine.engine import _resolve_persisted_hot_plan as resolve_hot_plan
 from freetoken.engine.engine import _validate_disk_prefill_task_size as validate_chunk
 from freetoken.moe.cpu_executor import (
@@ -212,6 +213,32 @@ def test_hot_gpu_budget_is_not_reserved_from_host_pin_budget(tmp_path, monkeypat
     # HOT capacity is VRAM-backed. It must not consume 100 bytes from the
     # 201-byte host pin budget and force a third layer onto DISK.
     assert auto_layers(config, 4) == frozenset({0, 3})
+
+
+def test_disk_and_pinned_hot_budgets_share_the_reserved_slot_pool(tmp_path):
+    _write_ftw_index(tmp_path, 4)
+    config = SimpleNamespace(
+        model_path=str(tmp_path),
+        model_config=SimpleNamespace(num_experts=4, num_experts_per_tok=1),
+        moe_cache_size=16,
+        moe_prefill_overlap=False,
+        moe_hot_expert_budget_gib=100 / 2**30,
+        moe_pinned_hot_budget_gib=100 / 2**30,
+        moe_hot_adapt_interval_steps=1000,
+        moe_disk_decode="cpu",
+        moe_disk_layer_profile=None,
+    )
+    plan, capacity, expert_bytes = resolve_hot_setup(
+        config,
+        frozenset({0, 3}),
+        4,
+        pinned_layer_ids=frozenset({1, 2}),
+    )
+
+    assert expert_bytes == 25
+    assert plan == {0: (), 1: (), 2: (), 3: ()}
+    assert capacity == {0: 2, 3: 2, 1: 2, 2: 2}
+    assert sum(capacity.values()) + 4 <= config.moe_cache_size
 
 
 def test_auto_budget_uses_lowest_profile_scores_with_stable_ties(tmp_path, monkeypatch):
@@ -645,6 +672,7 @@ def test_engine_config_defaults_disk_prefill_to_cpu():
     assert config.moe_disk_decode == "cpu"
     assert config.moe_gpu_prefill_layers == "auto"
     assert config.moe_hot_expert_budget_gib == 0
+    assert config.moe_pinned_hot_budget_gib == 0
     assert config.moe_hot_adapt_halflife_steps == 2000
     assert config.moe_hot_adapt_interval_steps == "auto"
     assert config.moe_hot_adapt_max_swap_gib == 0.5
@@ -670,6 +698,78 @@ def test_engine_config_rejects_invalid_hot_expert_budget(budget):
             dtype=torch.bfloat16,
             moe_hot_expert_budget_gib=budget,
         )
+
+
+@pytest.mark.parametrize("budget", [-1, float("inf"), float("nan")])
+def test_engine_config_rejects_invalid_pinned_hot_expert_budget(budget):
+    import torch
+
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+
+    with pytest.raises(
+        ValueError,
+        match="--moe-pinned-hot-budget-gib.*finite non-negative",
+    ):
+        EngineConfig(
+            model_path="/tmp/model",
+            tp_info=DistributedInfo(0, 1),
+            dtype=torch.bfloat16,
+            moe_pinned_hot_budget_gib=budget,
+        )
+
+
+@pytest.mark.parametrize(
+    ("backend", "accepted"),
+    [("offload", True), ("fused", False), ("cpu", False), ("hybrid", False)],
+)
+def test_pinned_hot_budget_requires_offload_backend(backend, accepted):
+    import torch
+
+    from freetoken.attention import AttnType
+    from freetoken.distributed import DistributedInfo
+    from freetoken.engine.config import EngineConfig
+    from freetoken.engine.engine import _adjust_config
+    from freetoken.models.config import KVCacheGroupSpec
+
+    config = EngineConfig(
+        model_path="/tmp/model",
+        tp_info=DistributedInfo(0, 1),
+        dtype=torch.bfloat16,
+        attention_backend="triton",
+        moe_backend=backend,
+        moe_pinned_hot_budget_gib=1.0,
+    )
+    spec = KVCacheGroupSpec(
+        name="full",
+        layer_ids=(0, 1),
+        num_kv_heads=1,
+        head_dim=64,
+        sliding_window=None,
+        mla=False,
+        index_head_dim=0,
+        num_index_layers=0,
+        index_ratio=1,
+        attn_type=AttnType.FULL,
+    )
+    object.__setattr__(config, "model_config", SimpleNamespace(
+        model_type="test",
+        single_stream_only=False,
+        is_moe=True,
+        expert_quant="none",
+        has_swa_attention=False,
+        has_linear_attention=False,
+        num_layers=2,
+        rotary_config=SimpleNamespace(max_position=1024),
+        kv_cache_group_specs=lambda: (spec,),
+        qwen4_args=None,
+        dsv4_args=None,
+    ))
+    if accepted:
+        _adjust_config(config)
+    else:
+        with pytest.raises(ValueError, match="requires --moe-backend offload"):
+            _adjust_config(config)
 
 
 @pytest.mark.parametrize("half_life", [0, -1, 1.5, True])

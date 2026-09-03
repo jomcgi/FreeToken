@@ -485,9 +485,15 @@ def load_indexed_banks(
     }
     for layer, expert_ids in seeded.items():
         capacities.setdefault(layer, len(expert_ids))
-    invalid = (set(seeded) | set(capacities)) - disk_layers
+    hot_eligible_layers = {
+        layer for layer, label in enumerate(residency)
+        if label in (HostResidency.DISK.value, HostResidency.PINNED.value)
+    }
+    invalid = (set(seeded) | set(capacities)) - hot_eligible_layers
     if invalid:
-        raise ValueError(f"HOT expert rows require DISK layers, got {sorted(invalid)}")
+        raise ValueError(
+            f"HOT expert rows require DISK or PINNED layers, got {sorted(invalid)}"
+        )
 
     for layer, capacity in sorted(capacities.items()):
         expert_ids = seeded.get(layer, ())

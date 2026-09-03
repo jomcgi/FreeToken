@@ -875,6 +875,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-pinned-hot-budget-gib",
+        type=float,
+        default=ServerArgs.moe_pinned_hot_budget_gib,
+        help=(
+            "GPU byte budget for protected HOT experts in pinned-host layers. "
+            "Rows share the protected slot pool and online adaptation with DISK "
+            "HOT rows. Requires --moe-backend offload. 0 disables it."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-hot-adapt-halflife-steps",
         type=int,
         default=ServerArgs.moe_hot_adapt_halflife_steps,

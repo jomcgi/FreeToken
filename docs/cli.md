@@ -91,6 +91,8 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-disk-layers` | none | FTW MoE layers kept in the DISK tier and computed on CPU |
 | `--moe-disk-pager` | madvise | DISK residency manager: portable file mmap advice or Linux-only `uffd` page paging with logical row prefetch |
 | `--moe-disk-lookahead` | on | Reuse the preceding decode route set for an early madvise WILLNEED sweep; no-op with `uffd` |
+| `--moe-hot-expert-budget-gib` | 0 | GPU budget for protected expert rows from DISK layers; requires DISK CPU decode |
+| `--moe-pinned-hot-budget-gib` | 0 | GPU budget for protected expert rows from PINNED layers; shares the slot pool and adaptation policy with DISK HOT rows and requires the offload backend |
 | `--host-cache-reserve-gib` | max(8 GiB, 15% of RAM) | Host RAM kept for the OS and expert-tier file cache |
 | `--moe-pager-budget-gib` | auto | Resident-byte ceiling for the UFFD page LRU, fitted with the expert pin budget |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |

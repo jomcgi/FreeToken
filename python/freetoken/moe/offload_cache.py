@@ -321,6 +321,7 @@ class OffloadMoeCache:
         self.hot_bank_sources: dict[str, list[torch.Tensor | None]] = {}
         self.hot_expert_ids: dict[int, tuple[int, ...]] = {}
         self.hot_expert_capacity: dict[int, int] = {}
+        self._pinned_hot_layer_ids: frozenset[int] = frozenset()
         self.hot_row_for_expert = torch.full(
             (self.num_layers, self.num_experts),
             -1,
@@ -453,6 +454,12 @@ class OffloadMoeCache:
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_hot_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
         self.stat_hot_total_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.stat_pinned_hot_pairs = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.stat_pinned_hot_total_pairs = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
         self._prefill_hot_pairs = 0
         self._prefill_route_pairs = 0
         self._prefill_cpu_experts = 0
@@ -468,6 +475,7 @@ class OffloadMoeCache:
         # accumulating without a per-step sync; each report subtracts this baseline to
         # compare the current protected set with the best set of the same per-layer size.
         self._protected_route_baseline: list[list[int]] | None = None
+        self._pinned_lru_baseline: list[tuple[int, int]] | None = None
         # (per-layer sources, cache) per bank, in schema order. Every piece of cache
         # machinery that moves bank bytes (copy_missing, the prefill double buffers,
         # bank_views) iterates this list, so the slot cache is bank-count agnostic.
@@ -592,8 +600,13 @@ class OffloadMoeCache:
             expert_ids = hot_expert_ids.get(layer_id, ())
             if not 0 <= layer_id < self.num_layers:
                 raise ValueError(f"HOT layer id {layer_id} is out of range")
-            if residency[layer_id] != HostResidency.DISK.value:
-                raise ValueError(f"HOT layer {layer_id} is not DISK resident")
+            if residency[layer_id] not in (
+                HostResidency.DISK.value,
+                HostResidency.PINNED.value,
+            ):
+                raise ValueError(
+                    f"HOT layer {layer_id} is neither DISK nor PINNED resident"
+                )
             if capacity <= 0 or capacity > self.num_experts or len(expert_ids) > capacity:
                 raise ValueError(
                     f"HOT layer {layer_id} capacity must be in [1, {self.num_experts}] "
@@ -608,6 +621,10 @@ class OffloadMoeCache:
         self._unpinned_layers = unpinned
         self.layer_residency = list(residency)
         self.hot_expert_capacity = hot_expert_capacity
+        self._pinned_hot_layer_ids = frozenset(
+            layer_id for layer_id in hot_expert_capacity
+            if residency[layer_id] == HostResidency.PINNED.value
+        )
         self.hot_expert_ids = {
             layer_id: hot_expert_ids.get(layer_id, ())
             for layer_id in hot_expert_capacity
@@ -819,7 +836,7 @@ class OffloadMoeCache:
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
-                if layer_id in self.hot_expert_capacity:
+                if self.is_hot_split_layer(layer_id):
                     # HOT decode is always a protected GPU-slot hit. DISK source
                     # rows reach the GPU only through the bounded staging bank.
                     layer_src_ptrs[layer_id].append(0)
@@ -1028,11 +1045,14 @@ class OffloadMoeCache:
         if not preserve_hot_state:
             self.stat_hot_pairs.zero_()
             self.stat_hot_total_pairs.zero_()
+            self.stat_pinned_hot_pairs.zero_()
+            self.stat_pinned_hot_total_pairs.zero_()
             self._prefill_hot_pairs = 0
             self._prefill_route_pairs = 0
             self._prefill_cpu_experts = 0
             self.decode_freq.zero_()
             self._protected_route_baseline = None
+            self._pinned_lru_baseline = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
         self._hit_d2d_fallback_logged = False  # geometry changed; re-log if still unusable
@@ -1104,7 +1124,17 @@ class OffloadMoeCache:
 
     def is_hot_split_layer(self, layer_id: int) -> bool:
         """Whether a DISK layer has a compact pinned HOT expert partition."""
-        return layer_id in self.hot_expert_capacity
+        return (
+            layer_id in self.hot_expert_capacity
+            and layer_id not in getattr(self, "_pinned_hot_layer_ids", ())
+        )
+
+    def is_pinned_hot_layer(self, layer_id: int) -> bool:
+        """Whether a PINNED layer owns protected rows but keeps plain decode."""
+        return (
+            layer_id in self.hot_expert_capacity
+            and layer_id in getattr(self, "_pinned_hot_layer_ids", ())
+        )
 
     def configure_hot_adaptation(
         self,
@@ -1252,7 +1282,7 @@ class OffloadMoeCache:
         self._checkpoint_published_hot_slot_owners()
         logger.info_rank0(
             f"MoE HOT expert residency: {sum(self.hot_expert_capacity.values())} "
-            f"protected GPU rows across {len(self.hot_expert_capacity)} DISK layers, "
+            f"protected GPU rows across {len(self.hot_expert_capacity)} layers, "
             f"hot_staging_gib={self.hot_staging_bytes / 2**30:.2f}, "
             f"hot_staging_rows={self._hot_staging_rows}"
         )
@@ -1301,6 +1331,12 @@ class OffloadMoeCache:
         slots = self._hot_slots_device
         if slots is not None and slots.numel():
             self.usage.index_fill_(0, slots, torch.iinfo(torch.int64).max)
+
+    def _protect_hot_layer_slots(self, layer_id: int) -> None:
+        """Restore one layer's contiguous protected range after an LRU hit."""
+        slots = self._hot_slot_for_row.get(layer_id, ())
+        if slots:
+            self.usage[slots[0]:slots[-1] + 1].fill_(torch.iinfo(torch.int64).max)
 
     def _restore_hot_slot_metadata(self) -> None:
         """Restore protected slot ownership after reset without reloading weights."""
@@ -1529,7 +1565,7 @@ class OffloadMoeCache:
                 ids = torch.tensor(experts, dtype=torch.int32, device=self.device)
                 self._pending_src_layer = layer_id
                 self._pending_whole_layer = False
-                if layer_id in self.hot_expert_capacity:
+                if self.is_hot_split_layer(layer_id):
                     offload_kernels.ensure_experts_hot(
                         self, layer_id, ids, record_stats=False
                     )
@@ -1688,6 +1724,7 @@ class OffloadMoeCache:
             budget_bytes=budget_bytes,
             expert_bytes=self.hot_adapt_expert_bytes,
             num_experts=self.num_experts,
+            capacities=self.hot_expert_capacity,
         )
         owners = {layer_id: tuple(rows) for layer_id, rows in self._hot_slot_owners.items()}
         swaps = plan_hot_swaps(
@@ -1925,7 +1962,10 @@ class OffloadMoeCache:
 
         document = make_hot_plan_document(
             identity=self._hot_plan_identity,
-            disk_layer_ids=tuple(sorted(self.hot_expert_capacity)),
+            disk_layer_ids=tuple(
+                layer_id for layer_id in sorted(self.hot_expert_capacity)
+                if self.is_hot_split_layer(layer_id)
+            ),
             num_layers=self.num_layers,
             num_experts=self.num_experts,
             hot_budget_bytes=self.hot_adapt_hot_budget_bytes,
@@ -2212,14 +2252,23 @@ class OffloadMoeCache:
         return clock.routed_tokens if clock is not None else 0
 
     def decayed_hot_pair_rate(self) -> float:
-        """Return the current decayed traffic share covered by published rows."""
+        """Return DISK HOT coverage, excluding PINNED protected traffic."""
         if not self.hot_adapt_enabled:
             return 0.0
         counts = self.decayed_decode_freq.tolist()
-        total = sum(sum(layer) for layer in counts)
+        disk_layers = (
+            [
+                layer_id for layer_id in self.hot_expert_capacity
+                if self.is_hot_split_layer(layer_id)
+            ]
+            if self.hot_expert_capacity
+            else list(self._hot_slot_owners)
+        )
+        total = sum(sum(counts[layer_id]) for layer_id in disk_layers)
         hot = sum(
             counts[layer_id][expert]
             for layer_id, owners in self._hot_slot_owners.items()
+            if layer_id in disk_layers
             for expert in owners if expert is not None
         )
         return hot / total if total else 0.0
@@ -2577,9 +2626,10 @@ class OffloadMoeCache:
         return schedule(layer_id, expert_ids) if schedule is not None else None
 
     def disk_prefetch_stats(self, *, reset: bool = False) -> dict:
-        if self.cpu_executor is None:
-            return {}
-        result = self.cpu_executor.disk_prefetch_stats(reset=reset)
+        result = (
+            self.cpu_executor.disk_prefetch_stats(reset=reset)
+            if self.cpu_executor is not None else {}
+        )
         hot_pairs = int(self.stat_hot_pairs.item())
         total_pairs = int(self.stat_hot_total_pairs.item())
         result["hot_pair_rate"] = hot_pairs / total_pairs if total_pairs else 0.0
@@ -2624,10 +2674,61 @@ class OffloadMoeCache:
         result["hot_adapt_ticks_prefill"] = ticks_prefill
         result["hot_adapt_ticks_decode"] = ticks_decode
         result["hot_adapt_ticks_idle"] = ticks_idle
+        pinned_layers = [
+            layer_id for layer_id in range(self.num_layers)
+            if self.layer_residency
+            and self.layer_residency[layer_id] == "pinned"
+        ]
+        pinned_hot_pairs = int(self.stat_pinned_hot_pairs.item())
+        pinned_hot_total = int(self.stat_pinned_hot_total_pairs.item())
+        result["pinned_hot_pair_rate"] = (
+            pinned_hot_pairs / pinned_hot_total if pinned_hot_total else 0.0
+        )
+        pinned_missing = 0
+        pinned_steps = 0
+        if self.collect_stats and pinned_layers:
+            lru = self.lru_stats.tolist()
+            baseline = self._pinned_lru_baseline or [
+                (0, 0) for _ in range(self.num_layers)
+            ]
+            pinned_missing = sum(
+                max(0, int(lru[layer_id][Stat.MISS]) - baseline[layer_id][0])
+                for layer_id in pinned_layers
+            )
+            pinned_steps = max(
+                (
+                    max(
+                        0,
+                        int(lru[layer_id][Stat.CALLS]) - baseline[layer_id][1],
+                    )
+                    for layer_id in pinned_layers
+                ),
+                default=0,
+            )
+            if reset:
+                self._pinned_lru_baseline = [
+                    (int(row[Stat.MISS]), int(row[Stat.CALLS])) for row in lru
+                ]
+        result["pinned_missing_per_step"] = (
+            pinned_missing / pinned_steps if pinned_steps else 0.0
+        )
+        expert_bytes = int(getattr(self, "hot_adapt_expert_bytes", 0) or 0)
+        if expert_bytes <= 0 and self.bank_sources:
+            # No adaptation configured: derive one expert row's bytes from the first
+            # bank that has a host source (DISK layers may carry None here).
+            for per_layer in self.bank_sources.values():
+                source = next((s for s in per_layer if s is not None), None)
+                if source is not None:
+                    expert_bytes += source[0].numel() * source.element_size()
+        result["pinned_h2d_bytes_per_step"] = (
+            result["pinned_missing_per_step"] * expert_bytes
+        )
         result.update(self.session_profile_stats(reset=reset))
         if reset:
             self.stat_hot_pairs.zero_()
             self.stat_hot_total_pairs.zero_()
+            self.stat_pinned_hot_pairs.zero_()
+            self.stat_pinned_hot_total_pairs.zero_()
             self._prefill_hot_pairs = 0
             self._prefill_route_pairs = 0
             self._prefill_cpu_experts = 0
@@ -2654,7 +2755,12 @@ class OffloadMoeCache:
         routed experts, where C is that layer's protected-slot capacity. Both oracle
         and realized hit rates use the exact routed-pair count as their denominator.
         """
-        if not self.collect_stats or not self.hot_expert_capacity or routed_pairs <= 0:
+        disk_capacity = {
+            layer_id: capacity
+            for layer_id, capacity in self.hot_expert_capacity.items()
+            if self.is_hot_split_layer(layer_id)
+        }
+        if not self.collect_stats or not disk_capacity or routed_pairs <= 0:
             return {}
 
         snapshot = self.decode_freq.tolist()
@@ -2665,7 +2771,7 @@ class OffloadMoeCache:
             ]
 
         oracle_hits = 0
-        for layer_id, capacity in self.hot_expert_capacity.items():
+        for layer_id, capacity in disk_capacity.items():
             counts = [
                 max(0, current - previous)
                 for current, previous in zip(
@@ -2996,12 +3102,25 @@ class OffloadMoeCache:
         self._prefill_buffer_released[buffer_id] = True
 
     def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
-        from freetoken.moe.offload_kernels import ensure_experts
+        from freetoken.moe.offload_kernels import bump_decayed_freq, ensure_experts
 
         self.record_decode_frequency(layer_id, expert_ids)
+        pinned_hot = self.is_pinned_hot_layer(layer_id)
+        if pinned_hot and self.collect_stats:
+            raw_ids = expert_ids.reshape(-1).long()
+            slots = self.slot_for_id[layer_id].index_select(0, raw_ids)
+            first_hot_slot = self.cache_size - sum(self.hot_expert_capacity.values())
+            self.stat_pinned_hot_pairs += (slots >= first_hot_slot).sum()
+            self.stat_pinned_hot_total_pairs += raw_ids.numel()
+        if pinned_hot and self.hot_adapt_enabled:
+            bump_decayed_freq(self, layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+        if pinned_hot:
+            # A protected hit receives the ordinary LRU timestamp. Restore the
+            # sentinel in the same captured stream before another layer can evict it.
+            self._protect_hot_layer_slots(layer_id)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -3110,6 +3229,9 @@ class OffloadMoeCache:
         self.stat_steps_layer.zero_()
         self.stat_hot_pairs.zero_()
         self.stat_hot_total_pairs.zero_()
+        self.stat_pinned_hot_pairs.zero_()
+        self.stat_pinned_hot_total_pairs.zero_()
+        self._pinned_lru_baseline = None
         self._prefill_hot_pairs = 0
         self._prefill_route_pairs = 0
         self._prefill_cpu_experts = 0

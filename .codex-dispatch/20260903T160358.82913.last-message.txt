@@ -1,0 +1,25 @@
+Implemented `--moe-pinned-hot-budget-gib` end to end, with default `0.0` behavior preserved.
+
+Key changes:
+
+- Shared protected-slot carve for DISK and PINNED hot layers.
+- PINNED layers retain plain decode, refillable source pointers, sentinel restoration, and decayed frequency tracking.
+- Mixed-capacity adaptation, pinned-bank staging, and backward-compatible plan persistence.
+- New PINNED hit, miss, and PCIe byte statistics plus scheduler status output.
+- Config, CLI validation, QUICKSTART, and CLI documentation updated.
+- GPU-free coverage added across cache behavior, planning, persistence, stats, config, and CLI.
+
+Changed files include [offload_cache.py](/Users/jomcgi/repos/ft-worktrees/pinned-hot/python/freetoken/moe/offload_cache.py), [offload_kernels.py](/Users/jomcgi/repos/ft-worktrees/pinned-hot/python/freetoken/moe/offload_kernels.py), [hot_adapt.py](/Users/jomcgi/repos/ft-worktrees/pinned-hot/python/freetoken/moe/hot_adapt.py), engine/config/CLI wiring, checkpoint loaders, scheduler reporting, documentation, and five test files.
+
+Verification:
+
+- Requested suite: `326 passed, 9 skipped`
+- Adjacent collect-stats suite: `5 passed`
+- Skips: eight CUDA-only tests and one unavailable CPU MoE extension test.
+- `compileall` and `git diff --check` passed.
+- No em-dashes were added.
+- No commit was created.
+
+The Mac-compatible run used a temporary CPU environment and Triton/slot-cache stub because the repository’s Torch 2.11 CUDA dependency has no Apple Silicon wheel.
+
+Open questions: none.

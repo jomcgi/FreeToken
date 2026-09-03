@@ -103,6 +103,75 @@ def test_hot_plan_round_trip_preserves_slot_order_counters_and_metadata(tmp_path
     assert seed.tier_mismatch
 
 
+def test_hot_plan_round_trips_pinned_layers_without_changing_document_shape(tmp_path):
+    path = tmp_path / HOT_PLAN_FILENAME
+    document = make_hot_plan_document(
+        identity=IDENTITY,
+        disk_layer_ids=(0,),
+        num_layers=3,
+        num_experts=4,
+        hot_budget_bytes=300,
+        tier_commit="tier",
+        protected_slots={0: (1, 3), 2: (2,)},
+        decayed_counters={
+            0: (1.0, 9.0, 2.0, 8.0),
+            2: (3.0, 4.0, 7.0, 1.0),
+        },
+        written_at=1000.0,
+    )
+    assert document is not None
+    assert document["disk_layer_ids"] == [0]
+    atomic_write_hot_plan(str(path), document)
+
+    seed = load_hot_plan(
+        str(path),
+        identity=IDENTITY,
+        disk_layer_ids=frozenset({0}),
+        num_layers=3,
+        num_experts=4,
+        current_capacity={0: 2, 2: 1},
+        current_hot_budget_bytes=300,
+        static_expert_ids={0: (), 2: ()},
+        tier_commit="tier",
+        now=1060.0,
+    )
+    assert seed.expert_ids == {0: (1, 3), 2: (2,)}
+    assert seed.seeded_layers == frozenset({0, 2})
+
+
+def test_older_disk_only_plan_leaves_new_pinned_layer_unseeded(tmp_path):
+    path = tmp_path / HOT_PLAN_FILENAME
+    document = make_hot_plan_document(
+        identity=IDENTITY,
+        disk_layer_ids=(0,),
+        num_layers=3,
+        num_experts=4,
+        hot_budget_bytes=200,
+        tier_commit="tier-old",
+        protected_slots={0: (0, 3)},
+        decayed_counters={0: (1.0, 9.0, 8.0, 2.0)},
+        written_at=1000.0,
+    )
+    assert document is not None
+    atomic_write_hot_plan(str(path), document)
+
+    seed = load_hot_plan(
+        str(path),
+        identity=IDENTITY,
+        disk_layer_ids=frozenset({0}),
+        num_layers=3,
+        num_experts=4,
+        current_capacity={0: 2, 2: 2},
+        current_hot_budget_bytes=400,
+        static_expert_ids={0: (), 2: ()},
+        tier_commit="tier-new",
+        now=1060.0,
+    )
+    assert seed.expert_ids[0] == (3, 0)
+    assert seed.expert_ids[2] == ()
+    assert seed.seeded_layers == frozenset({0})
+
+
 def test_hot_plan_identity_mismatch_is_ignored_by_loader(tmp_path):
     path = tmp_path / HOT_PLAN_FILENAME
     document = _document()

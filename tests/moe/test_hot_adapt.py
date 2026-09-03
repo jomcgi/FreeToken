@@ -77,6 +77,218 @@ def _offload_cache_class_without_triton(monkeypatch):
         sys.modules.pop("freetoken.moe.offload_cache", None)
 
 
+def _offload_kernels_without_triton(monkeypatch):
+    """Import CPU kernel mirrors with inert Triton and flashlib surfaces."""
+    triton = ModuleType("triton")
+    triton.jit = lambda fn=None, **_kwargs: (
+        (lambda decorated: decorated) if fn is None else fn
+    )
+    triton.next_power_of_2 = lambda value: value
+    triton.cdiv = lambda value, divisor: (value + divisor - 1) // divisor
+    language = ModuleType("triton.language")
+    language.constexpr = object()
+    triton.language = language
+    slot_cache = ModuleType("flashlib.kernels.slot_cache")
+    slot_cache.lru_ensure = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "triton", triton)
+    monkeypatch.setitem(sys.modules, "triton.language", language)
+    monkeypatch.setitem(sys.modules, "flashlib.kernels.slot_cache", slot_cache)
+    monkeypatch.delitem(sys.modules, "freetoken.moe.offload_kernels", raising=False)
+    return importlib.import_module("freetoken.moe.offload_kernels")
+
+
+def _mixed_hot_cache(monkeypatch, *, pinned_capacity=2):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    sources = {
+        "gate_up": [
+            torch.arange(12, dtype=torch.int32).view(4, 3),
+            torch.arange(12, dtype=torch.int32).view(4, 3) + 100,
+        ],
+        "down": [
+            torch.arange(8, dtype=torch.int32).view(4, 2),
+            torch.arange(8, dtype=torch.int32).view(4, 2) + 100,
+        ],
+    }
+    cache = OffloadMoeCache(
+        num_layers=2,
+        num_experts=4,
+        cache_size=12,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0})
+    capacities = {0: 2}
+    ids = {0: (0, 1)}
+    if pinned_capacity:
+        capacities[1] = pinned_capacity
+        ids[1] = tuple(range(pinned_capacity))
+    cache.set_bank_sources(
+        sources,
+        layer_residency=[HostResidency.DISK.value, HostResidency.PINNED.value],
+        hot_expert_ids=ids,
+        hot_expert_capacity=capacities,
+    )
+    return cache, sources
+
+
+def test_mixed_hot_carve_and_zero_pinned_budget_geometry(monkeypatch):
+    mixed, _ = _mixed_hot_cache(monkeypatch)
+    assert mixed._hot_slot_for_row == {0: (8, 9), 1: (10, 11)}
+    assert mixed.is_hot_split_layer(0)
+    assert not mixed.is_hot_split_layer(1)
+    assert mixed.is_pinned_hot_layer(1)
+    assert set(mixed._hot_slot_for_row[0]).isdisjoint(mixed._hot_slot_for_row[1])
+
+    disk_only, _ = _mixed_hot_cache(monkeypatch, pinned_capacity=0)
+    assert disk_only._hot_slot_for_row == {0: (10, 11)}
+    assert min(disk_only._hot_slot_for_row[0]) == 10
+
+
+def test_hot_gate_rejects_locked_but_accepts_pinned(monkeypatch):
+    import torch
+
+    from freetoken.moe.host_banks import HostResidency
+
+    cache, sources = _mixed_hot_cache(monkeypatch)
+    assert cache.is_pinned_hot_layer(1)
+    rejected = type(cache)(
+        num_layers=2,
+        num_experts=4,
+        cache_size=12,
+        device=torch.device("cpu"),
+        prefill_overlap=False,
+        decode_target="cpu",
+    )
+    rejected.cpu_layer_ids = frozenset({0, 1})
+    with pytest.raises(ValueError, match="neither DISK nor PINNED"):
+        rejected.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.DISK.value, HostResidency.LOCKED.value],
+            hot_expert_capacity={1: 1},
+        )
+
+
+def test_copy_plan_keeps_pinned_hot_source_and_zeros_disk_hot_source(monkeypatch):
+    import torch
+
+    OffloadMoeCache = _offload_cache_class_without_triton(monkeypatch)
+    module_globals = OffloadMoeCache._build_copy_plan.__globals__
+    pinned_module = ModuleType("freetoken.kernel.pinned")
+    pinned_module.device_ptr = lambda tensor: tensor.data_ptr()
+    monkeypatch.setitem(sys.modules, "freetoken.kernel.pinned", pinned_module)
+    monkeypatch.setitem(module_globals, "_FUSED_COPY", True)
+    real_tensor = torch.tensor
+
+    def cpu_descriptor(data, *args, **kwargs):
+        kwargs["device"] = "cpu"
+        return real_tensor(data, *args, **kwargs)
+
+    monkeypatch.setattr(module_globals["torch"], "tensor", cpu_descriptor)
+    cache = OffloadMoeCache.__new__(OffloadMoeCache)
+    cache.device = SimpleNamespace(type="cuda")
+    cache.num_layers = 2
+    cache.hot_expert_capacity = {0: 1, 1: 1}
+    cache._pinned_hot_layer_ids = frozenset({1})
+    cache.layer_residency = ["disk", "pinned"]
+    cache._unpinned_layers = frozenset({0})
+    per_layer = [torch.zeros((4, 4), dtype=torch.int32) for _ in range(2)]
+    cache.banks = [(per_layer, torch.zeros((8, 4), dtype=torch.int32))]
+
+    cache._build_copy_plan()
+
+    assert cache._copy_src_ptrs_host[0] == [0]
+    assert cache._copy_src_ptrs_host[1] == [per_layer[1].data_ptr()]
+
+
+def test_pinned_hot_decay_counter_and_plain_ensure_orchestration(monkeypatch):
+    import torch
+
+    kernels = _offload_kernels_without_triton(monkeypatch)
+    cache, _ = _mixed_hot_cache(monkeypatch)
+    cache.record_decode_frequency = lambda *_args: None
+    cache.hot_adapt_enabled = True
+    cache._hot_decay_factor = 0.5
+    cache.decayed_decode_freq[1].fill_(2.0)
+    cache.ensure_experts(1, torch.tensor([1, 1, 3], dtype=torch.int32))
+
+    assert cache.decayed_decode_freq[0].tolist() == [0.0] * 4
+    assert cache.decayed_decode_freq[1].tolist() == pytest.approx(
+        [1.0, 3.0, 1.0, 2.0]
+    )
+    assert cache.usage[10:].tolist() == [torch.iinfo(torch.int64).max] * 2
+
+    row = torch.tensor([4.0, 2.0, 0.0, 8.0])
+    kernels._bump_decayed_freq_cpu(
+        row, torch.tensor([0, 2, 2]), 0.25, 4
+    )
+    assert row.tolist() == pytest.approx([2.0, 0.5, 2.0, 2.0])
+
+    before = cache.decayed_decode_freq.clone()
+    cache.hot_adapt_enabled = False
+    cache.ensure_experts(1, torch.tensor([0], dtype=torch.int32))
+    assert torch.equal(cache.decayed_decode_freq, before)
+
+
+def test_mixed_capacity_planner_uses_each_layers_capacity():
+    counts = {0: (1, 9, 2, 8), 1: (7, 3, 6, 5)}
+    assert recompute_hot_partition(
+        counts,
+        frozenset({0, 1}),
+        budget_bytes=30,
+        expert_bytes=10,
+        num_experts=4,
+        capacities={0: 1, 1: 2},
+    ) == {0: (1,), 1: (0, 2)}
+
+
+def test_pinned_swap_stages_directly_from_bank_tensor(monkeypatch):
+    import builtins
+    import torch
+
+    cache, sources = _mixed_hot_cache(monkeypatch)
+    cache._hot_staging_rows = 1
+    cache._hot_staging = [
+        torch.empty_like(sources[name][1][:1]) for name in cache.bank_schema
+    ]
+    monkeypatch.setattr(
+        builtins,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("PINNED staging must not open a file"),
+    )
+    copied, _ = cache._stage_hot_rows(
+        None, (HotSwap(1, 0, incoming_expert=3, outgoing_expert=0),)
+    )
+    assert copied == {(1, 0)}
+    assert torch.equal(cache._hot_staging[0][0], sources["gate_up"][1][3])
+
+
+def test_pinned_lru_stats_report_missing_bytes_and_keep_disk_rate(monkeypatch):
+    cache, sources = _mixed_hot_cache(monkeypatch)
+    stat = cache.disk_prefetch_stats.__globals__["Stat"]
+    cache.collect_stats = True
+    cache.lru_stats[1, stat.MISS] = 6
+    cache.lru_stats[1, stat.CALLS] = 2
+    cache.stat_pinned_hot_pairs.fill_(3)
+    cache.stat_pinned_hot_total_pairs.fill_(4)
+    cache.stat_hot_pairs.fill_(1)
+    cache.stat_hot_total_pairs.fill_(2)
+
+    stats = cache.disk_prefetch_stats(reset=True)
+    expert_bytes = sum(
+        bank[0][0].numel() * bank[0].element_size()
+        for bank in sources.values()
+    )
+    assert stats["pinned_hot_pair_rate"] == pytest.approx(0.75)
+    assert stats["pinned_missing_per_step"] == pytest.approx(3.0)
+    assert stats["pinned_h2d_bytes_per_step"] == pytest.approx(3 * expert_bytes)
+    assert stats["hot_pair_rate"] == pytest.approx(0.5)
+
+
 @pytest.mark.parametrize(
     ("hot_gib", "expected_ticks", "expected_interval"),
     [(48, 96, 20), (6, 12, 166)],

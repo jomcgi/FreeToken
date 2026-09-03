@@ -115,6 +115,20 @@ def test_hot_adapt_interval_accepts_auto_or_an_explicit_integer(value, expected)
     assert args.moe_hot_adapt_interval_steps == expected
 
 
+def test_pinned_hot_budget_cli_defaults_off_and_accepts_float():
+    default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
+    configured, _ = parse_args([
+        "--model",
+        ANON_PATH,
+        "--dtype",
+        "bfloat16",
+        "--moe-pinned-hot-budget-gib",
+        "1.25",
+    ])
+    assert default.moe_pinned_hot_budget_gib == 0.0
+    assert configured.moe_pinned_hot_budget_gib == 1.25
+
+
 @pytest.mark.parametrize("value", ["auto", "bf16", "fp8_e4m3"])
 def test_kv_cache_dtype_cli_choices(value):
     args, _ = parse_args(

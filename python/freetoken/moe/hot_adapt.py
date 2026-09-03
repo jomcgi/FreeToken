@@ -241,13 +241,14 @@ def load_hot_plan(
     if not all(isinstance(section, dict) for section in (protected, counters_raw, ranked_raw)):
         raise ValueError("HOT plan layer sections must be objects")
 
+    hot_layer_ids = frozenset(int(layer_id) for layer_id in current_capacity)
     selected = {
         layer_id: tuple(int(expert) for expert in static_expert_ids.get(layer_id, ()))
-        for layer_id in disk_layer_ids
+        for layer_id in hot_layer_ids
     }
     counters: dict[int, tuple[float, ...]] = {}
     seeded_layers: set[int] = set()
-    for layer_id in sorted(disk_layer_ids):
+    for layer_id in sorted(hot_layer_ids):
         key = str(layer_id)
         if key not in protected:
             continue
@@ -711,28 +712,38 @@ def update_decayed_counts(
 
 def recompute_hot_partition(
     expert_counts: Mapping[int, Sequence[float]],
-    disk_layer_ids: frozenset[int],
+    hot_layer_ids: frozenset[int],
     *,
     budget_bytes: int,
     expert_bytes: int,
     num_experts: int,
+    capacities: Mapping[int, int] | None = None,
 ) -> dict[int, tuple[int, ...]]:
-    """Select an equal top-N partition under the configured resident-byte budget."""
+    """Select each protected layer's top experts under its fixed capacity."""
     if budget_bytes < 0 or expert_bytes <= 0 or num_experts <= 0:
         raise ValueError("HOT planner geometry must be non-negative with positive rows")
-    if not disk_layer_ids or budget_bytes == 0:
+    if not hot_layer_ids or budget_bytes == 0:
         return {}
-    missing = set(disk_layer_ids) - set(expert_counts)
+    missing = set(hot_layer_ids) - set(expert_counts)
     if missing:
-        raise ValueError(f"counts have no entries for DISK layers {sorted(missing)}")
-    top_n = min(
-        num_experts,
-        budget_bytes // (expert_bytes * len(disk_layer_ids)),
-    )
-    if top_n <= 0:
-        return {}
+        raise ValueError(
+            f"counts have no entries for protected layers {sorted(missing)}"
+        )
+    if capacities is None:
+        top_n = min(
+            num_experts,
+            budget_bytes // (expert_bytes * len(hot_layer_ids)),
+        )
+        capacities = {layer_id: top_n for layer_id in hot_layer_ids}
+    elif set(capacities) != set(hot_layer_ids):
+        raise ValueError("HOT capacities must cover exactly the protected layers")
+    if sum(int(value) for value in capacities.values()) * expert_bytes > budget_bytes:
+        raise ValueError("HOT capacities exceed the configured resident-byte budget")
     result = {}
-    for layer_id in sorted(disk_layer_ids):
+    for layer_id in sorted(hot_layer_ids):
+        top_n = min(num_experts, int(capacities[layer_id]))
+        if top_n <= 0:
+            continue
         counts = expert_counts[layer_id]
         if len(counts) != num_experts:
             raise ValueError(
