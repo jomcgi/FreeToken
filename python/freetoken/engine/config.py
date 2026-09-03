@@ -124,6 +124,10 @@ class EngineConfig:
     # faults only LRU-missing routed expert rows into a pinned staging ring, copies
     # them into the existing GPU slot cache, and runs the normal GPU expert GEMM.
     moe_disk_decode: str = "cpu"
+    # With DISK CPU decode and protected HOT rows, fetch at most this many distinct
+    # COLD experts per layer and step into non-protected GPU LRU slots. Zero keeps
+    # the original HOT GPU plus COLD CPU split unchanged.
+    moe_cold_fetch_max: int = 0
     # DISK bank residency backend. "madvise" preserves the file-mmap path; "uffd"
     # installs FTW expert rows into anonymous mappings under a userspace LRU.
     moe_disk_pager: str = "madvise"
@@ -333,6 +337,19 @@ class EngineConfig:
             raise ValueError(
                 "--moe-disk-decode must be 'cpu' or 'gpufetch', got "
                 f"{self.moe_disk_decode!r}"
+            )
+        if (
+            isinstance(self.moe_cold_fetch_max, bool)
+            or not isinstance(self.moe_cold_fetch_max, int)
+            or self.moe_cold_fetch_max < 0
+        ):
+            raise ValueError("--moe-cold-fetch-max must be a non-negative integer")
+        if self.moe_cold_fetch_max > 0 and self.moe_disk_decode != "cpu":
+            raise ValueError("--moe-cold-fetch-max requires --moe-disk-decode cpu")
+        if self.moe_cold_fetch_max > 0 and self.moe_hot_expert_budget_gib <= 0:
+            raise ValueError(
+                "--moe-cold-fetch-max requires a non-zero "
+                "--moe-hot-expert-budget-gib"
             )
         if (
             not math.isfinite(float(self.moe_hot_expert_budget_gib))

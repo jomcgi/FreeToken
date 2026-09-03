@@ -217,6 +217,8 @@ class OffloadMoeCache:
     # DISK-only decode policy. gpufetch keeps the mmap as the authoritative host
     # bank but fills LRU misses through a bounded pinned staging ring.
     moe_disk_decode: str = "cpu"
+    # DISK CPU-decode cold-fetch cap. Zero preserves the original HOT/COLD split.
+    moe_cold_fetch_max: int = 0
     # "bf16" (default, dense expert weights) or one of the NVFP4 bank layouts:
     # "nvfp4" (native ModelOpt rows, FreeToken Triton kernels), "nvfp4_marlin"
     # (Marlin-tiled, vLLM W4A16 GEMM, sm_80-99) or "nvfp4_b12x" (flashinfer SM12x
@@ -259,6 +261,7 @@ class OffloadMoeCache:
             "grouped", "decode"
         ), self.moe_prefill_split_kernel
         assert self.moe_disk_decode in ("cpu", "gpufetch"), self.moe_disk_decode
+        assert self.moe_cold_fetch_max >= 0, self.moe_cold_fetch_max
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
@@ -453,6 +456,24 @@ class OffloadMoeCache:
         self.stat_steps_layer = torch.zeros(self.num_layers, dtype=torch.int64, device=self.device)
         self.stat_hot_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
         self.stat_hot_total_pairs = torch.zeros((), dtype=torch.int64, device=self.device)
+        # Always-available policy counters. No operations touch them when the cap is
+        # zero, so the disabled path has no per-layer overhead.
+        self.stat_cold_fetched_experts = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.stat_cold_cpu_experts = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.stat_cold_fetch_bytes = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.stat_gpu_all_layers = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.stat_cold_fetch_layer_calls = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self.cold_fetch_expert_bytes = 0
         self._prefill_hot_pairs = 0
         self._prefill_route_pairs = 0
         self._prefill_cpu_experts = 0
@@ -485,6 +506,7 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        self._pending_cold_fetch = False
         # DISK gpufetch is initialized after the CPU executor exists, because its
         # existing coordinator owns the graph-safe doorbell. The staging tensors are
         # host-pinned; only tiny pointer/index descriptors live on the GPU.
@@ -684,6 +706,10 @@ class OffloadMoeCache:
         if self.device.type == "cuda":
             self._hot_mapping_host = self._hot_mapping_host.pin_memory()
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        self.cold_fetch_expert_bytes = sum(
+            math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
+            for per_layer, _cache in self.banks
+        )
         self._build_copy_plan()
         if any(buffer_id >= 0 for buffer_id in self._prefill_overlap_buffer_ids):
             self._init_prefill_overlap_buffers()
@@ -729,10 +755,20 @@ class OffloadMoeCache:
             i for i, residency in enumerate(self.layer_residency)
             if residency == "disk"
         ]
-        if self.moe_disk_decode != "gpufetch" or not disk_layers:
+        needs_cold_fetch = self.moe_cold_fetch_max > 0 and bool(
+            self.hot_expert_capacity
+        )
+        if (
+            self.moe_disk_decode != "gpufetch" and not needs_cold_fetch
+        ) or not disk_layers:
             return
         if self.device.type != "cuda":
-            raise RuntimeError("--moe-disk-decode gpufetch requires CUDA")
+            mode = (
+                "--moe-disk-decode gpufetch"
+                if self.moe_disk_decode == "gpufetch"
+                else "--moe-cold-fetch-max"
+            )
+            raise RuntimeError(f"{mode} requires CUDA")
         from freetoken.kernel.pinned import alloc_pinned_tensor
 
         capacity = disk_gpufetch_capacity(
@@ -969,6 +1005,11 @@ class OffloadMoeCache:
         self.stat_steps_layer.zero_()
         self.stat_hot_pairs.zero_()
         self.stat_hot_total_pairs.zero_()
+        self.stat_cold_fetched_experts.zero_()
+        self.stat_cold_cpu_experts.zero_()
+        self.stat_cold_fetch_bytes.zero_()
+        self.stat_gpu_all_layers.zero_()
+        self.stat_cold_fetch_layer_calls.zero_()
         self._prefill_hot_pairs = 0
         self._prefill_route_pairs = 0
         self._prefill_cpu_experts = 0
@@ -2538,6 +2579,22 @@ class OffloadMoeCache:
             if self._prefill_route_pairs else 0.0
         )
         result["prefill_cpu_experts"] = self._prefill_cpu_experts
+        layer_calls = int(self.stat_cold_fetch_layer_calls.item())
+        policy_layers = len(self.hot_expert_capacity)
+        policy_steps = layer_calls / policy_layers if policy_layers else 0.0
+        divisor = policy_steps if policy_steps else 1.0
+        result["cold_fetched_experts_per_step"] = (
+            int(self.stat_cold_fetched_experts.item()) / divisor
+        )
+        result["cold_cpu_experts_per_step"] = (
+            int(self.stat_cold_cpu_experts.item()) / divisor
+        )
+        result["cold_fetch_bytes_per_step"] = (
+            int(self.stat_cold_fetch_bytes.item()) / divisor
+        )
+        result["gpu_all_layers_per_step"] = (
+            int(self.stat_gpu_all_layers.item()) / divisor
+        )
         ticks = self.hot_adapt_ticks - self._hot_adapt_ticks_reported
         ticks_prefill = (
             self.hot_adapt_ticks_prefill - self._hot_adapt_ticks_prefill_reported
@@ -2569,6 +2626,11 @@ class OffloadMoeCache:
         if reset:
             self.stat_hot_pairs.zero_()
             self.stat_hot_total_pairs.zero_()
+            self.stat_cold_fetched_experts.zero_()
+            self.stat_cold_cpu_experts.zero_()
+            self.stat_cold_fetch_bytes.zero_()
+            self.stat_gpu_all_layers.zero_()
+            self.stat_cold_fetch_layer_calls.zero_()
             self._prefill_hot_pairs = 0
             self._prefill_route_pairs = 0
             self._prefill_cpu_experts = 0
@@ -2942,6 +3004,7 @@ class OffloadMoeCache:
         self.record_decode_frequency(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._pending_cold_fetch = False
         ensure_experts(self, layer_id, expert_ids)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -2959,6 +3022,7 @@ class OffloadMoeCache:
         self.record_decode_frequency(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._pending_cold_fetch = False
         ensure_experts_hybrid(
             self, layer_id, expert_ids, self.hybrid_max_fetch, self.hybrid_fetch_fraction
         )
@@ -2986,12 +3050,42 @@ class OffloadMoeCache:
         self.record_decode_frequency(layer_id, expert_ids)
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
+        self._pending_cold_fetch = False
         ensure_experts_hot(self, layer_id, expert_ids)
         # The kernel updates hit timestamps for compatibility with ordinary LRU.
         # Restore the permanent sentinel inside graph capture so later layers in
         # the same decode step cannot evict HOT slots.
         self._protect_hot_slots()
         return routed_tokens
+
+    def ensure_cold_experts_fetch(
+        self,
+        layer_id: int,
+        raw_expert_ids: torch.Tensor,
+        routed_slot_ids: torch.Tensor,
+    ) -> None:
+        """Add a bounded COLD fetch to an already-classified HOT route view.
+
+        The selected cold set is installed transactionally: if every selected miss
+        cannot use the staging ring and a non-protected LRU slot, no cold expert is
+        installed and ``routed_slot_ids`` retains the original HOT/COLD split.
+        """
+        from freetoken.moe.offload_kernels import ensure_cold_experts_fetch
+
+        if self.moe_cold_fetch_max <= 0 or layer_id not in self.hot_expert_capacity:
+            return
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        self._pending_cold_fetch = True
+        ensure_cold_experts_fetch(
+            self,
+            layer_id,
+            raw_expert_ids,
+            routed_slot_ids,
+            self.moe_cold_fetch_max,
+            self._gpufetch_capacity,
+        )
+        self._protect_hot_slots()
 
     def record_hot_adapt_prefill_tokens(self, routed_tokens: int) -> None:
         """Record a token count returned by the prefill HOT split counting path."""
@@ -3017,6 +3111,7 @@ class OffloadMoeCache:
 
         self._pending_src_layer = layer_id
         self._pending_whole_layer = True
+        self._pending_cold_fetch = False
         materialize_layer(self, layer_id)
 
     def reset(self) -> None:
@@ -3051,6 +3146,11 @@ class OffloadMoeCache:
         self.stat_steps_layer.zero_()
         self.stat_hot_pairs.zero_()
         self.stat_hot_total_pairs.zero_()
+        self.stat_cold_fetched_experts.zero_()
+        self.stat_cold_cpu_experts.zero_()
+        self.stat_cold_fetch_bytes.zero_()
+        self.stat_gpu_all_layers.zero_()
+        self.stat_cold_fetch_layer_calls.zero_()
         self._prefill_hot_pairs = 0
         self._prefill_route_pairs = 0
         self._prefill_cpu_experts = 0
@@ -3177,14 +3277,18 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if layer_id in self.hot_expert_capacity and not self._pending_whole_layer:
+        if (
+            layer_id in self.hot_expert_capacity
+            and not self._pending_whole_layer
+            and not self._pending_cold_fetch
+        ):
             # Published HOT experts are permanent GPU hits; COLD experts route to
             # the CPU partial. No decode reload source exists by design.
             return
-        if layer_id in self._unpinned_layers and not (
-            layer_id in self.hot_expert_capacity and not self._pending_whole_layer
-        ):
-            if self.is_gpufetch_layer(layer_id) and not self._pending_whole_layer:
+        if layer_id in self._unpinned_layers:
+            if (
+                self.is_gpufetch_layer(layer_id) or self._pending_cold_fetch
+            ) and not self._pending_whole_layer:
                 assert self.cpu_executor is not None
                 assert self._gpufetch_num_host is not None
                 assert self._gpufetch_ids_host is not None

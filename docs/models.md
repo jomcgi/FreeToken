@@ -105,6 +105,15 @@ partial is combined with the GPU partial through the hybrid decode merge. The de
 budget is 0, which preserves pure whole-layer residency. Expert-granular residency
 currently requires `--moe-disk-decode cpu`.
 
+With `--moe-cold-fetch-max N > 0`, DISK layers apply a per-step residency policy:
+when the distinct cold experts for the step number at most N, they are fetched into
+non-protected GPU slots and the entire layer computes on the GPU, eliminating CPU
+round-trip latency (~1.9 ms per trip). When the cold set exceeds the budget, up to N
+cold experts are fetched and the remaining routes use the split path (GPU hot + CPU
+cold). Fetched experts consume non-protected LRU slots and fall back gracefully if no
+free slot or staging-ring capacity is available. This mode requires
+`--moe-disk-decode cpu` and a non-zero `--moe-hot-expert-budget-gib`.
+
 Explicit `--moe-disk-layers` always takes precedence for layer selection. A malformed
 or incomplete layer-score profile produces a warning and falls back to the head and
 tail split. HOT residency treats a missing or malformed per-expert section as a startup

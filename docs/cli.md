@@ -92,6 +92,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-disk-layers` | none | FTW MoE layers kept in the DISK tier and computed on CPU |
 | `--moe-disk-pager` | madvise | DISK residency manager: portable file mmap advice or Linux-only `uffd` page paging with logical row prefetch |
 | `--moe-disk-lookahead` | on | Reuse the preceding decode route set for an early madvise WILLNEED sweep; no-op with `uffd` |
+| `--moe-cold-fetch-max` | 0 | When > 0 with `--moe-disk-decode cpu` and a hot budget, fetch cold experts into non-protected GPU slots if the distinct cold expert count per layer per step is at most N; otherwise use the split path (GPU hot + CPU cold). Eliminates CPU round trips for small cold sets at the cost of GPU memory for staging. With 0 (default), behaviour is unchanged. [Stats: cold_fetched_experts/step, cold_cpu_experts/step, cold_fetch_bytes/step, gpu_all_layers/step] |
 | `--host-cache-reserve-gib` | max(8 GiB, 15% of RAM) | Host RAM kept for the OS and expert-tier file cache |
 | `--moe-pager-budget-gib` | auto | Resident-byte ceiling for the UFFD page LRU, fitted with the expert pin budget |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |

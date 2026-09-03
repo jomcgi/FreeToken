@@ -62,6 +62,40 @@ def ensure_experts_hybrid(
     _ensure_experts_hybrid_gpu(cache, layer_id, expert_ids, max_fetch, frac_q16)
 
 
+def ensure_cold_experts_fetch(
+    cache,
+    layer_id: int,
+    raw_expert_ids: torch.Tensor,
+    routed_slot_ids: torch.Tensor,
+    max_fetch: int,
+    ring_capacity: int,
+) -> None:
+    """Install a bounded prefix of distinct COLD routes in dynamic GPU slots.
+
+    ``routed_slot_ids`` has already passed through ``ensure_experts_hot`` and
+    therefore contains protected HOT slots or -1. The selected cold set is
+    installed only when every selected miss fits, which makes slot or staging
+    exhaustion fall back to the unchanged HOT/COLD split.
+    """
+    if not raw_expert_ids.is_cuda:
+        return _ensure_cold_experts_fetch_cpu(
+            cache,
+            layer_id,
+            raw_expert_ids,
+            routed_slot_ids,
+            max_fetch,
+            ring_capacity,
+        )
+    _ensure_cold_experts_fetch_gpu(
+        cache,
+        layer_id,
+        raw_expert_ids,
+        routed_slot_ids,
+        max_fetch,
+        ring_capacity,
+    )
+
+
 def ensure_experts_hot(
     cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool = True
 ) -> None:
@@ -224,6 +258,44 @@ def _ensure_experts_hybrid_gpu(
     )
 
 
+def _ensure_cold_experts_fetch_gpu(
+    cache,
+    layer_id: int,
+    raw_expert_ids: torch.Tensor,
+    routed_slot_ids: torch.Tensor,
+    max_fetch: int,
+    ring_capacity: int,
+) -> None:
+    block_e = triton.next_power_of_2(cache.num_experts)
+    block_c = triton.next_power_of_2(cache.cache_size)
+    _ensure_cold_experts_fetch_kernel[(1,)](
+        raw_expert_ids,
+        routed_slot_ids,
+        cache.slot_for_id,
+        cache.id_of_slot,
+        cache.usage,
+        cache.step,
+        cache.evict_slots,
+        cache.src_indices,
+        cache.num_indices,
+        cache.stat_cold_fetched_experts,
+        cache.stat_cold_cpu_experts,
+        cache.stat_cold_fetch_bytes,
+        cache.stat_gpu_all_layers,
+        cache.stat_cold_fetch_layer_calls,
+        layer_id,
+        raw_expert_ids.numel(),
+        int(max_fetch),
+        int(ring_capacity),
+        int(cache.cold_fetch_expert_bytes),
+        cache.num_experts,
+        cache.cache_size,
+        BLOCK_E=block_e,
+        BLOCK_C=block_c,
+        num_warps=8 if block_c >= 2048 else 4,
+    )
+
+
 def _ensure_experts_hot_gpu(
     cache, layer_id: int, expert_ids: torch.Tensor, *, record_stats: bool
 ) -> None:
@@ -318,6 +390,77 @@ def _ensure_experts_hybrid_cpu(
     flat = expert_ids.view(-1)
     for i in range(flat.numel()):
         flat[i] = int(cache.slot_for_id[layer_id, int(flat[i].item())].item())
+
+
+def _ensure_cold_experts_fetch_cpu(
+    cache,
+    layer_id: int,
+    raw_expert_ids: torch.Tensor,
+    routed_slot_ids: torch.Tensor,
+    max_fetch: int,
+    ring_capacity: int,
+) -> None:
+    """CPU reference for the protected-slot cold-fetch planner."""
+    raw = [int(expert) for expert in raw_expert_ids.reshape(-1).tolist()]
+    hot_slots = [int(slot) for slot in routed_slot_ids.reshape(-1).tolist()]
+    cold = []
+    for expert, slot in zip(raw, hot_slots):
+        if slot < 0 and expert not in cold:
+            cold.append(expert)
+    selected = cold[: int(max_fetch)]
+    selected_ids = {
+        layer_id * cache.num_experts + expert for expert in selected
+    }
+    missing = [
+        expert for expert in selected
+        if int(cache.slot_for_id[layer_id, expert].item()) < 0
+    ]
+    max_usage = torch.iinfo(torch.int64).max
+    candidates = [
+        slot for slot in range(cache.cache_size)
+        if int(cache.usage[slot].item()) != max_usage
+        and int(cache.id_of_slot[slot].item()) not in selected_ids
+    ]
+    can_install = len(missing) <= int(ring_capacity) and len(missing) <= len(candidates)
+    fetched = 0
+    if can_install:
+        step = int(cache.step.item())
+        usage = cache.usage.tolist()
+        for expert in selected:
+            slot = int(cache.slot_for_id[layer_id, expert].item())
+            if slot >= 0:
+                cache.usage[slot] = step
+                usage[slot] = step
+        for idx, expert in enumerate(missing):
+            victim = min(candidates, key=lambda slot: (usage[slot], slot))
+            candidates.remove(victim)
+            old_id = int(cache.id_of_slot[victim].item())
+            if old_id >= 0:
+                cache.slot_for_id.view(-1)[old_id] = -1
+            cache.id_of_slot[victim] = layer_id * cache.num_experts + expert
+            cache.slot_for_id[layer_id, expert] = victim
+            cache.usage[victim] = step
+            usage[victim] = step
+            cache.evict_slots[idx] = victim
+            cache.src_indices[idx] = expert
+        fetched = len(missing)
+
+    selected_set = set(selected) if can_install else set()
+    flat = routed_slot_ids.reshape(-1)
+    for idx, (expert, hot_slot) in enumerate(zip(raw, hot_slots)):
+        if hot_slot >= 0:
+            flat[idx] = hot_slot
+        elif expert in selected_set:
+            flat[idx] = int(cache.slot_for_id[layer_id, expert].item())
+        else:
+            flat[idx] = -1
+    cold_cpu = len(cold) - len(selected_set)
+    cache.num_indices.fill_(fetched)
+    cache.stat_cold_fetched_experts += fetched
+    cache.stat_cold_cpu_experts += cold_cpu
+    cache.stat_cold_fetch_bytes += fetched * int(cache.cold_fetch_expert_bytes)
+    cache.stat_gpu_all_layers += int(cold_cpu == 0)
+    cache.stat_cold_fetch_layer_calls += 1
 
 
 def _ensure_experts_hot_cpu(
@@ -608,6 +751,141 @@ def _ensure_experts_hybrid_kernel(
     if BY_RECENCY:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "layer_id",
+        "num_active",
+        "max_fetch",
+        "ring_capacity",
+        "expert_bytes",
+    ]
+)
+def _ensure_cold_experts_fetch_kernel(
+    raw_ids_ptr,
+    routed_slots_ptr,
+    slot_for_id_ptr,
+    id_of_slot_ptr,
+    usage_ptr,
+    step_ptr,
+    evict_slots_ptr,
+    src_indices_ptr,
+    num_indices_ptr,
+    stat_fetched_ptr,
+    stat_cpu_ptr,
+    stat_bytes_ptr,
+    stat_all_gpu_ptr,
+    stat_calls_ptr,
+    layer_id,
+    num_active,
+    max_fetch,
+    ring_capacity,
+    expert_bytes,
+    num_experts: tl.constexpr,
+    cache_size: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    """Transactionally add the first N distinct COLD routes to dynamic slots."""
+    base = layer_id * num_experts
+    off_e = tl.arange(0, BLOCK_E)
+    e_mask = off_e < num_experts
+    cold_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+    selected = tl.zeros((BLOCK_E,), dtype=tl.int1)
+    first_pos = tl.zeros((BLOCK_E,), dtype=tl.int32) + num_active
+
+    # Route order, rather than expert id, defines the stable first-N policy.
+    for i in tl.range(num_active):
+        expert = tl.load(raw_ids_ptr + i)
+        is_cold = tl.load(routed_slots_ptr + i) < 0
+        matches = (off_e == expert) & e_mask
+        unseen = tl.sum((selected & matches).to(tl.int32)) == 0
+        room = tl.sum(selected.to(tl.int32)) < max_fetch
+        take = is_cold & unseen & room
+        cold_active = cold_active | (matches & is_cold)
+        selected = selected | (matches & take)
+        first_pos = tl.where(matches & take, i, first_pos)
+
+    cold_count = tl.sum(cold_active.to(tl.int32))
+    selected_count = tl.sum(selected.to(tl.int32))
+    slots = tl.load(
+        slot_for_id_ptr + base + off_e, mask=e_mask, other=-1
+    )
+    missing = selected & (slots < 0) & e_mask
+    num_missing = tl.sum(missing.to(tl.int32))
+
+    off_c = tl.arange(0, BLOCK_C)
+    c_mask = off_c < cache_size
+    owner = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
+    usage = tl.load(
+        usage_ptr + off_c,
+        mask=c_mask,
+        other=9223372036854775807,
+    ).to(tl.int64)
+    owner_selected = c_mask & False
+    for i in tl.range(num_active):
+        expert = tl.load(raw_ids_ptr + i)
+        chosen = tl.sum(
+            tl.where((off_e == expert) & selected, 1, 0)
+        ) > 0
+        owner_selected = owner_selected | (chosen & (owner == base + expert))
+    candidate = c_mask & (~owner_selected) & (usage < 9223372036854775807)
+    available = tl.sum(candidate.to(tl.int32))
+    can_install = (num_missing <= ring_capacity) & (num_missing <= available)
+
+    step = tl.load(step_ptr)
+    selected_hit = selected & (slots >= 0) & can_install
+    tl.store(usage_ptr + slots, step, mask=selected_hit)
+    victim_usage = tl.where(
+        candidate, usage, 9223372036854775807
+    )
+    remaining = missing
+    if can_install:
+        for i in tl.range(num_missing):
+            victim = tl.argmin(victim_usage, axis=0).to(tl.int32)
+            old_id = tl.sum(tl.where(off_c == victim, owner, 0))
+            if old_id >= 0:
+                tl.store(slot_for_id_ptr + old_id, -1)
+            expert = tl.argmin(
+                tl.where(remaining, first_pos, num_active + 1), axis=0
+            ).to(tl.int32)
+            tl.store(id_of_slot_ptr + victim, base + expert)
+            tl.store(slot_for_id_ptr + base + expert, victim)
+            tl.store(usage_ptr + victim, step)
+            tl.store(evict_slots_ptr + i, victim)
+            tl.store(src_indices_ptr + i, expert)
+            victim_usage = tl.where(
+                off_c == victim, 9223372036854775807, victim_usage
+            )
+            remaining = remaining & (off_e != expert)
+
+    for i in tl.range(num_active):
+        expert = tl.load(raw_ids_ptr + i)
+        hot_slot = tl.load(routed_slots_ptr + i)
+        chosen = tl.sum(
+            tl.where((off_e == expert) & selected, 1, 0)
+        ) > 0
+        cold_slot = tl.load(slot_for_id_ptr + base + expert)
+        result = tl.where(
+            hot_slot >= 0,
+            hot_slot,
+            tl.where(can_install & chosen, cold_slot, -1),
+        )
+        tl.store(routed_slots_ptr + i, result)
+
+    fetched = tl.where(can_install, num_missing, 0).to(tl.int64)
+    cold_gpu = tl.where(can_install, selected_count, 0)
+    cold_cpu = (cold_count - cold_gpu).to(tl.int64)
+    tl.store(num_indices_ptr, fetched)
+    tl.store(stat_fetched_ptr, tl.load(stat_fetched_ptr) + fetched)
+    tl.store(stat_cpu_ptr, tl.load(stat_cpu_ptr) + cold_cpu)
+    tl.store(stat_bytes_ptr, tl.load(stat_bytes_ptr) + fetched * expert_bytes)
+    tl.store(
+        stat_all_gpu_ptr,
+        tl.load(stat_all_gpu_ptr) + (cold_cpu == 0).to(tl.int64),
+    )
+    tl.store(stat_calls_ptr, tl.load(stat_calls_ptr) + 1)
 
 
 @triton.jit(do_not_specialize=["layer_id", "num_active"])

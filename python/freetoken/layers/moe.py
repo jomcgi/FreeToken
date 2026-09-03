@@ -470,6 +470,10 @@ class OffloadMoELayer(MoELayer):
         """Current HOT/COLD split for a DISK layer, using the hybrid merge contract."""
         raw = topk_ids.clone()
         cache.ensure_experts_hot(self.layer_id, topk_ids)
+        if getattr(cache, "moe_cold_fetch_max", 0) > 0:
+            fetch_cold = getattr(cache, "ensure_cold_experts_fetch", None)
+            if fetch_cold is not None:
+                fetch_cold(self.layer_id, raw, topk_ids)
         return self._decode_split_partials(
             cache, hidden_states, topk_weights, topk_ids, raw
         )

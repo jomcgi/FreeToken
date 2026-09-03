@@ -1060,6 +1060,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-cold-fetch-max",
+        type=int,
+        default=ServerArgs.moe_cold_fetch_max,
+        help=(
+            "With DISK CPU decode and a HOT expert budget, fetch at most N distinct "
+            "COLD experts per layer and step into non-protected GPU slots. 0 "
+            "disables the policy (default)."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-disk-pager",
         choices=["madvise", "uffd"],
         default=ServerArgs.moe_disk_pager,

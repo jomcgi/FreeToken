@@ -1255,9 +1255,9 @@ class CpuMoeExecutor:
         )
         if not all(hasattr(self._ext, name) for name in required):
             raise RuntimeError(
-                "the CPU MoE extension needs rebuilding for --moe-disk-decode "
-                "gpufetch; run `python setup.py build_ext --inplace` or reinstall "
-                "the wheel"
+                "the CPU MoE extension needs rebuilding for DISK expert staging "
+                "(--moe-disk-decode gpufetch or --moe-cold-fetch-max); run "
+                "`python setup.py build_ext --inplace` or reinstall the wheel"
             )
         task = self._ext.create_gpufetch_task(
             layer_id,

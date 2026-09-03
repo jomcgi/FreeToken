@@ -936,6 +936,7 @@ class Engine:
                     config, "moe_prefill_split_kernel", "grouped"
                 ),
                 moe_disk_decode=config.moe_disk_decode,
+                moe_cold_fetch_max=getattr(config, "moe_cold_fetch_max", 0),
                 quant_format=banks.quant_format,
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
@@ -990,6 +991,10 @@ class Engine:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
             cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
+            if hasattr(cache, "moe_cold_fetch_max"):
+                cache.moe_cold_fetch_max = getattr(
+                    config, "moe_cold_fetch_max", 0
+                )
             if disk_layer_ids:
                 residency = getattr(cache, "layer_residency", None)
                 try:
@@ -2664,6 +2669,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_split_kernel": "grouped",
     "moe_cpu_prefill_batch": "on",
     "moe_disk_decode": "cpu",
+    "moe_cold_fetch_max": 0,
     "moe_disk_pager": "madvise",
     "moe_disk_lookahead": "on",
     "moe_step_timing": False,
