@@ -1440,6 +1440,7 @@ struct MoeTask {
   bool timing_active = false;
   uint64_t timing_experts = 0;
   uint64_t timing_bytes = 0;
+  int active_threads = 0;
 };
 
 struct StepTimingAccum {
@@ -1725,6 +1726,11 @@ struct CpuMoeExecutor {
   std::atomic<int> done_count{0};
   std::atomic<int> bar_count{0};
   std::atomic<int> bar_sense{0};
+  std::mutex bar_mtx;
+  std::condition_variable bar_cv;
+  std::atomic<int> decode_threads{0};
+  std::atomic<int> barrier_mode{0};  // 0 = spin, 1 = hybrid
+  std::atomic<int> barrier_spin_us{30};
 
   std::mutex step_timing_mtx;
   std::vector<StepTimingAccum> step_timing;
@@ -2140,9 +2146,39 @@ struct CpuMoeExecutor {
   const char* isa_name() const { return isa; }
   const char* prefill_batch_kernel_name() const { return nvi8batch_name; }
 
-  void barrier(int& local_sense) {
+  void barrier(int& local_sense, int participants) {
     local_sense ^= 1;
-    if (bar_count.fetch_add(1) + 1 == num_threads) {
+    if (barrier_mode.load(std::memory_order_relaxed) == 1) {
+      if (bar_count.fetch_add(1) + 1 == participants) {
+        {
+          std::lock_guard<std::mutex> lk(bar_mtx);
+          bar_count.store(0);
+          bar_sense.store(local_sense);
+        }
+        bar_cv.notify_all();
+        return;
+      }
+
+      const auto spin_start = std::chrono::steady_clock::now();
+      uint32_t spin_count = 0;
+      while (bar_sense.load() != local_sense) {
+#if CPU_MOE_X86
+        _mm_pause();
+#endif
+        if ((++spin_count & 63u) == 0 &&
+            std::chrono::steady_clock::now() - spin_start >=
+                std::chrono::microseconds(
+                    barrier_spin_us.load(std::memory_order_relaxed)))
+          break;
+      }
+      if (bar_sense.load() != local_sense) {
+        std::unique_lock<std::mutex> lk(bar_mtx);
+        bar_cv.wait(lk, [&] { return bar_sense.load() == local_sense; });
+      }
+      return;
+    }
+
+    if (bar_count.fetch_add(1) + 1 == participants) {
       bar_count.store(0);
       bar_sense.store(local_sense);
     } else {
@@ -2672,7 +2708,7 @@ struct CpuMoeExecutor {
       if (t->group_routes) do_pass1_grouped(t, p);
       else do_pass1(t, p);
     }
-    barrier(local_sense);
+    barrier(local_sense, t->active_threads);
     // Row-major fp4: prepare the intermediate rows (per token,route) before the down
     // GEMV -- ds_fp4 FP8 round-trips (DSV4 act_quant), both deinterleave to fp32; q4_0
     // W4A8 Q8_0-quantizes. Needs all of pass1 done (a full row spans every iblk).
@@ -2682,7 +2718,7 @@ struct CpuMoeExecutor {
         if (r >= prt_total) break;
         prep_g_row(r);
       }
-      barrier(local_sense);
+      barrier(local_sense, t->active_threads);
     }
     for (;;) {
       int64_t p = p2_next.fetch_add(1, std::memory_order_relaxed);
@@ -2691,7 +2727,7 @@ struct CpuMoeExecutor {
       else do_pass2(t, p);
     }
     if (t->group_routes) {
-      barrier(local_sense);
+      barrier(local_sense, t->active_threads);
       for (;;) {
         int64_t p = p3_next.fetch_add(1, std::memory_order_relaxed);
         if (p >= p3_total) break;
@@ -2712,7 +2748,7 @@ struct CpuMoeExecutor {
         my_gen = cur_gen;
         t = cur_task;
       }
-      run_task_body(t);
+      if (tid < t->active_threads) run_task_body(t);
       if (done_count.fetch_add(1) + 1 == num_threads) {
         completed.store(my_gen, std::memory_order_release);
         {
@@ -2743,14 +2779,15 @@ struct CpuMoeExecutor {
         my_gen = cur_gen;
         t = cur_task;
       }
-      if (t->timing_active) {
+      const bool participates = tid < t->active_threads;
+      if (participates && t->timing_active) {
         int64_t expected = 0;
         if (t->t_first_worker_ns.compare_exchange_strong(
                 expected, -1, std::memory_order_acq_rel)) {
           t->t_first_worker_ns.store(steady_now_ns(), std::memory_order_release);
         }
       }
-      run_task_body(t);
+      if (participates) run_task_body(t);
       if (done_count.fetch_add(1) + 1 == num_threads) {
         if (t->timing_active)
           t->t_compute_done_ns.store(steady_now_ns(), std::memory_order_release);
@@ -2920,6 +2957,11 @@ struct CpuMoeExecutor {
 
   void submit(MoeTask* t, bool run_pre_callback = true,
               bool coordinator_submission = false) {
+    const int decode_cap = decode_threads.load(std::memory_order_relaxed);
+    t->active_threads =
+        coordinator_submission && t->group_routes && !t->prefill_batch && decode_cap > 0
+        ? std::min(decode_cap, num_threads)
+        : num_threads;
     // Persistent group_routes tasks are decode tasks. Prefill remains outside the
     // per-step snapshot even when diagnostics are enabled.
     const bool time_task = t->group_routes &&
@@ -3329,6 +3371,21 @@ struct CpuMoeExecutor {
     pre_run_callback_mode.store(mode, std::memory_order_relaxed);
   }
 
+  void set_decode_threads(int threads) {
+    if (threads < 0 || threads > num_threads)
+      throw std::invalid_argument("decode threads must be in [0, num_threads]");
+    decode_threads.store(threads, std::memory_order_relaxed);
+  }
+
+  void set_barrier_mode(int mode, int spin_us) {
+    if (mode != 0 && mode != 1)
+      throw std::invalid_argument("barrier mode must be 0 or 1");
+    if (spin_us <= 0)
+      throw std::invalid_argument("barrier spin duration must be positive");
+    barrier_spin_us.store(spin_us, std::memory_order_relaxed);
+    barrier_mode.store(mode, std::memory_order_relaxed);
+  }
+
   void gpufetch_with_cuda_stream(uintptr_t stream, uintptr_t task) {
     cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream),
                        &CpuMoeExecutor::gpufetch_cb,
@@ -3411,6 +3468,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("callback"))
       .def("set_pre_run_callback_mode", &CpuMoeExecutor::set_pre_run_callback_mode,
            py::arg("mode"))
+      .def("set_decode_threads", &CpuMoeExecutor::set_decode_threads,
+           py::arg("threads"))
+      .def("set_barrier_mode", &CpuMoeExecutor::set_barrier_mode,
+           py::arg("mode"), py::arg("spin_us"))
       .def("register_flag_task", &CpuMoeExecutor::register_flag_task,
            py::arg("slot"), py::arg("task"))
       .def("register_flag_gpufetch_task", &CpuMoeExecutor::register_flag_gpufetch_task,

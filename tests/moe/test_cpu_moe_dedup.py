@@ -104,3 +104,48 @@ def test_grouped_decode_skips_invalid_routes_like_ungrouped_reference():
     ungrouped = executor.prefill(0, hidden, weights, ids)
 
     assert torch.equal(grouped, ungrouped)
+
+
+@pytest.mark.parametrize(
+    "configure",
+    [
+        lambda ext: ext.set_decode_threads(2),
+        lambda ext: ext.set_barrier_mode(1, 30),
+    ],
+    ids=["two_decode_threads", "hybrid_barrier"],
+)
+def test_grouped_decode_worker_policy_matches_all_threads(configure):
+    try:
+        from freetoken.kernel import _cpu_moe
+    except ImportError:
+        pytest.skip("Linux CPU MoE extension is not built")
+    required = ("set_decode_threads", "set_barrier_mode")
+    if not all(hasattr(_cpu_moe.CpuMoeExecutor, name) for name in required):
+        pytest.skip("CPU MoE extension needs rebuilding for worker policy")
+
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    torch.manual_seed(1311)
+    experts, hidden_size, intermediate, top_k, batch = 8, 64, 64, 3, 4
+    cache = _make_bf16_cache(experts, hidden_size, intermediate)
+    common = dict(
+        top_k=top_k,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        num_threads=4,
+        max_tokens=batch,
+        device=torch.device("cpu"),
+    )
+    reference = CpuMoeExecutor(cache, **common)
+    configured = CpuMoeExecutor(cache, **common)
+    configure(configured._ext)
+    hidden = torch.randn(batch, hidden_size, dtype=torch.bfloat16)
+    weights = torch.rand(batch, top_k, dtype=torch.float32)
+    ids = torch.tensor(
+        [[0, 1, 2], [0, 1, 3], [0, 1, 4], [0, 1, 5]], dtype=torch.int32
+    )
+
+    expected = _run_grouped_decode_on_cpu(reference, hidden, weights, ids)
+    actual = _run_grouped_decode_on_cpu(configured, hidden, weights, ids)
+
+    assert torch.equal(actual, expected)

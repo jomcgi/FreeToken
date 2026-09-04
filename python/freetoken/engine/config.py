@@ -73,6 +73,12 @@ class EngineConfig:
     # CPU MoE backend (--moe-backend cpu): number of CPU worker threads computing
     # the decode experts. 0 = auto (physical cores). Ignored by other backends.
     moe_cpu_threads: int = 0
+    # Decode-only worker cap. 0 keeps every worker active. Prefill always uses the
+    # full pool.
+    moe_cpu_decode_threads: int = 0
+    # Pass-barrier wait policy. Hybrid spins briefly before sleeping on a condvar.
+    moe_cpu_barrier: str = "spin"
+    moe_cpu_barrier_spin_us: int = 30
     # Hybrid CPU/GPU decode (--moe-backend offload only): which MoE layers decode on
     # the CPU executor instead of the GPU offload/PCIe path. Spec is an explicit id
     # list ("3,7,11"), a count ("8" -> 8 layers evenly strided across depth), or a
@@ -336,6 +342,23 @@ class EngineConfig:
                 "--moe-cpu-prefill-batch must be 'on' or 'off', got "
                 f"{self.moe_cpu_prefill_batch!r}"
             )
+        if self.moe_cpu_decode_threads < 0:
+            raise ValueError("--moe-cpu-decode-threads must be non-negative")
+        if (
+            self.moe_cpu_decode_threads > 0
+            and self.moe_cpu_threads > 0
+            and self.moe_cpu_decode_threads > self.moe_cpu_threads
+        ):
+            raise ValueError(
+                "--moe-cpu-decode-threads cannot exceed --moe-cpu-threads"
+            )
+        if self.moe_cpu_barrier not in ("spin", "hybrid"):
+            raise ValueError(
+                "--moe-cpu-barrier must be 'spin' or 'hybrid', got "
+                f"{self.moe_cpu_barrier!r}"
+            )
+        if self.moe_cpu_barrier_spin_us <= 0:
+            raise ValueError("--moe-cpu-barrier-spin-us must be positive")
         if self.moe_cpu_precb not in ("before", "after"):
             raise ValueError(
                 "--moe-cpu-precb must be 'before' or 'after', got "

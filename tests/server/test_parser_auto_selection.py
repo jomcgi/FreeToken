@@ -159,6 +159,46 @@ def test_moe_cpu_precb_rejects_unknown_mode():
         )
 
 
+def test_moe_cpu_worker_policy_defaults_and_accepts_nondefaults():
+    base = ["--model", ANON_PATH, "--dtype", "bfloat16"]
+    default, _ = parse_args(base)
+    configured, _ = parse_args(
+        [
+            *base,
+            "--moe-cpu-decode-threads",
+            "6",
+            "--moe-cpu-barrier",
+            "hybrid",
+        ]
+    )
+
+    assert default.moe_cpu_decode_threads == 0
+    assert default.moe_cpu_barrier == "spin"
+    assert default.moe_cpu_barrier_spin_us == 30
+    assert configured.moe_cpu_decode_threads == 6
+    assert configured.moe_cpu_barrier == "hybrid"
+
+
+def test_moe_cpu_worker_policy_rejects_invalid_values():
+    base = ["--model", ANON_PATH, "--dtype", "bfloat16"]
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--moe-cpu-decode-threads", "-1"])
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--moe-cpu-barrier", "sleep"])
+    with pytest.raises(SystemExit):
+        parse_args([*base, "--moe-cpu-barrier-spin-us", "0"])
+    with pytest.raises(ValueError, match="cannot exceed"):
+        parse_args(
+            [
+                *base,
+                "--moe-cpu-threads",
+                "4",
+                "--moe-cpu-decode-threads",
+                "6",
+            ]
+        )
+
+
 def test_moe_cpu_willneed_defaults_and_accepts_recent():
     default, _ = parse_args(["--model", ANON_PATH, "--dtype", "bfloat16"])
     recent, _ = parse_args(

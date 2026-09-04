@@ -324,12 +324,15 @@ class CpuMoeExecutor:
         activation: str,
         apply_router_weight_on_input: bool,
         num_threads: int,
+        moe_cpu_decode_threads: int = 0,
         max_tokens: int,
         device: torch.device,
         swiglu_alpha: float = 1.702,
         swiglu_limit: float | None = None,
         disk_lookahead: bool = True,
         step_timing: bool = False,
+        moe_cpu_barrier: str = "spin",
+        moe_cpu_barrier_spin_us: int = 30,
         moe_cpu_precb: str = "before",
         moe_cpu_willneed: str = "always",
         moe_cpu_willneed_recent_steps: int = 256,
@@ -507,6 +510,18 @@ class CpuMoeExecutor:
             coord_core = core_ids[-1]
             nthreads -= 1
             core_ids = core_ids[:-1]
+        if not 0 <= int(moe_cpu_decode_threads) <= nthreads:
+            raise ValueError(
+                "moe_cpu_decode_threads must be 0 or no greater than the resolved "
+                f"worker count ({nthreads}), got {moe_cpu_decode_threads}"
+            )
+        if moe_cpu_barrier not in ("spin", "hybrid"):
+            raise ValueError(
+                "moe_cpu_barrier must be 'spin' or 'hybrid', got "
+                f"{moe_cpu_barrier!r}"
+            )
+        if int(moe_cpu_barrier_spin_us) <= 0:
+            raise ValueError("moe_cpu_barrier_spin_us must be positive")
         self._coord_core = coord_core
         self._ext = _cpu_moe.CpuMoeExecutor(
             num_threads=nthreads,
@@ -523,6 +538,11 @@ class CpuMoeExecutor:
             swiglu_limit=float(swiglu_limit) if swiglu_limit is not None else float("inf"),
             core_ids=core_ids,
             **ptrs,
+        )
+        self._configure_worker_policy(
+            int(moe_cpu_decode_threads),
+            moe_cpu_barrier,
+            int(moe_cpu_barrier_spin_us),
         )
         self._configure_pre_run_callback_mode(moe_cpu_precb)
         self._configure_prefill_batch()
@@ -632,6 +652,14 @@ class CpuMoeExecutor:
     def _configure_pre_run_callback_mode(self, mode: str) -> None:
         if mode == "after":
             self._ext.set_pre_run_callback_mode(1)
+
+    def _configure_worker_policy(
+        self, decode_threads: int, barrier: str, barrier_spin_us: int
+    ) -> None:
+        if decode_threads:
+            self._ext.set_decode_threads(decode_threads)
+        if barrier != "spin" or barrier_spin_us != 30:
+            self._ext.set_barrier_mode(1 if barrier == "hybrid" else 0, barrier_spin_us)
 
     def _configure_willneed(
         self, mode: str, recent_steps: int, fault_ceiling: float

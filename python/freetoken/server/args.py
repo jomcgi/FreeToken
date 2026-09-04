@@ -117,6 +117,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _nonnegative_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
     def _harness_prefix(value: str) -> str:
         kind, separator, prefix = value.partition("=")
         if not separator or not kind.strip() or not prefix.strip():
@@ -836,6 +845,30 @@ def parse_args(
             "Number of CPU worker threads for --moe-backend cpu decode experts. "
             "0 = auto (physical cores)."
         ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-decode-threads",
+        type=_nonnegative_int,
+        default=ServerArgs.moe_cpu_decode_threads,
+        help=(
+            "Decode-only CPU worker cap. 0 uses every worker; prefill always uses "
+            "the full --moe-cpu-threads pool."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-cpu-barrier",
+        choices=["spin", "hybrid"],
+        default=ServerArgs.moe_cpu_barrier,
+        help="CPU MoE pass-barrier wait policy (default: spin).",
+    )
+
+    parser.add_argument(
+        "--moe-cpu-barrier-spin-us",
+        type=_positive_int,
+        default=ServerArgs.moe_cpu_barrier_spin_us,
+        help="Microseconds to spin before a hybrid CPU MoE barrier sleeps (default: 30).",
     )
 
     parser.add_argument(

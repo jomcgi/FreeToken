@@ -172,6 +172,36 @@ def test_pre_run_callback_mode_is_forwarded_to_native_executor():
     assert calls == [1]
 
 
+def test_worker_policy_is_forwarded_to_native_executor_when_configured():
+    calls = []
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor._ext = SimpleNamespace(
+        set_decode_threads=lambda value: calls.append(("decode", value)),
+        set_barrier_mode=lambda mode, spin_us: calls.append(
+            ("barrier", mode, spin_us)
+        ),
+    )
+
+    executor._configure_worker_policy(6, "hybrid", 30)
+
+    assert calls == [("decode", 6), ("barrier", 1, 30)]
+
+
+def test_default_worker_policy_does_not_call_native_setters():
+    calls = []
+    executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
+    executor._ext = SimpleNamespace(
+        set_decode_threads=lambda value: calls.append(("decode", value)),
+        set_barrier_mode=lambda mode, spin_us: calls.append(
+            ("barrier", mode, spin_us)
+        ),
+    )
+
+    executor._configure_worker_policy(0, "spin", 30)
+
+    assert calls == []
+
+
 def test_step_timing_breakdown_is_zero_and_does_not_call_native_when_off():
     executor = CpuMoeExecutor.__new__(CpuMoeExecutor)
     executor._step_timing = False

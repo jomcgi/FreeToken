@@ -1,0 +1,18 @@
+Implemented both CPU MoE mechanisms without committing.
+
+Changed:
+
+- CLI/config/engine plumbing in [args.py](/Users/jomcgi/repos/ft-worktrees/decode-threads/python/freetoken/server/args.py), [config.py](/Users/jomcgi/repos/ft-worktrees/decode-threads/python/freetoken/engine/config.py), and [engine.py](/Users/jomcgi/repos/ft-worktrees/decode-threads/python/freetoken/engine/engine.py).
+- Python executor setter configuration in [cpu_executor.py](/Users/jomcgi/repos/ft-worktrees/decode-threads/python/freetoken/moe/cpu_executor.py).
+- Decode participant cap and hybrid barrier in [cpu_moe_ext.cpp](/Users/jomcgi/repos/ft-worktrees/decode-threads/python/freetoken/kernel/csrc/cpu_moe/cpu_moe_ext.cpp).
+- CLI documentation in [cli.md](/Users/jomcgi/repos/ft-worktrees/decode-threads/docs/cli.md).
+- Python plumbing, validation, and Linux-native parity tests.
+
+Verification:
+
+- Required suite: 28 passed.
+- Native worker-policy tests: 2 skipped because `_cpu_moe` is unbuilt on this Mac.
+- Parser suite could not collect because Triton is unavailable, as anticipated.
+- Syntax, changed-file lint, whitespace, balanced C++ braces, and no added em dashes all pass.
+
+Open questions: none.
