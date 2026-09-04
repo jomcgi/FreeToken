@@ -1477,7 +1477,7 @@ def test_decode_hot_split_uses_default_route_weight(monkeypatch):
     monkeypatch.setattr(
         layer,
         "_decode_split_partials",
-        lambda cache, hidden, weights, ids, raw: hidden,
+        lambda cache, hidden, weights, ids, raw, **kwargs: hidden,
     )
     hidden = torch.zeros((1, 8), dtype=torch.bfloat16)
     weights = torch.ones((1, 2), dtype=torch.float32)
