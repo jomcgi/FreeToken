@@ -1381,7 +1381,7 @@ class CpuMoeExecutor:
         if is_prefill:
             return self._prefetch_selected(layer_id, selected)
 
-        if self._moe_cpu_willneed == "recent":
+        if getattr(self, "_moe_cpu_willneed", "always") == "recent":
             selected = self._filter_recent_willneed(int(layer_id), selected)
 
         predicted_by_layer = getattr(self, "_disk_predicted_experts", {})
